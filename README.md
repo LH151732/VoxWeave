@@ -95,18 +95,27 @@ host. To build for a different target, override per-invocation: `make install TO
 
 </details>
 
-**End-user install** (puts the global `voxweave` command on PATH):
+**Install from PyPI** (puts the global `voxweave` command on PATH):
+
+```bash
+uv tool install --torch-backend=cu128 voxweave              # core pipeline — same as voxweave[qwen]
+uv tool install --torch-backend=cu128 "voxweave[whisper]"   # + faster-whisper hybrid engine
+uv tool install --torch-backend=cu128 "voxweave[all]"       # core + whisper (everything)
+```
+
+The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
+Japanese/CJK), layout, song-skip — plus CJK line-break and translation are baked into the
+**core dependencies**, so a bare `uv tool install voxweave` already works out of the box.
+`voxweave[qwen]` is a no-op back-compat alias for the same core; `[whisper]` adds the
+faster-whisper hybrid engine and `[all]` = core + whisper.
+
+**From source** (for development or pulling new code):
 
 ```bash
 make install        # = uv tool install --torch-backend=cu128 ".[all]"
 make reinstall      # after pulling new code
 make uninstall
 ```
-
-The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
-Japanese/CJK), layout, song-skip — plus CJK line-break and translation are baked into the
-**core dependencies**, so a bare `uv tool install voxweave` already works out of the box.
-`[all]` additionally pulls the faster-whisper hybrid engine.
 
 <details>
 <summary><b>Extras & what each pulls</b></summary>
