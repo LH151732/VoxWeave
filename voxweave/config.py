@@ -1,0 +1,254 @@
+"""User configuration ``~/.config/voxweave.conf`` (TOML).
+
+Precedence: CLI options > environment variables > config file > built-in defaults.
+Pure stdlib (``tomllib`` 3.11+), no torch dependency. Values are string names;
+the backend resolves them to torchaudio bundles / HF ids / Qwen models.
+On first CLI run, :func:`ensure_default_config` writes a commented template.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import tomllib
+from pathlib import Path
+
+log = logging.getLogger("voxweave")
+
+# Built-in defaults (mirrors backend.ASR_MODEL / FUSION_*).
+DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
+# Dual-ASR fusion (--hybrid): whisper supplies text, Qwen supplies punctuation.
+# 0.6B emits no punctuation, so fusion must use 1.7B.
+DEFAULT_FUSION_WHISPER = "large-v3"
+DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
+# Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
+#
+# en: facebook/wav2vec2-large-960h-lv60-self loaded via HF (same LV60K-self weights as
+#     the torchaudio bundle), per-cue crop alignment (<=120s). Torchaudio bundle name
+#     also accepted for back-compat.
+#
+# ja: "mms" = MMS-300m ONNX + uroman, full-file single pass (align_blocks_full_mms,
+#     equivalent to whisperx fork align_ctc). Full-file is required: per-cue cropping
+#     causes coarse routing errors that drift timestamps — empirically misplaced
+#     エルダドワーフ by 11s. xlsr full-file is O(T²) so 23 min → ~300 GB OOM; only
+#     MMS (ctc-forced-aligner internal windowing) can handle full-file safely.
+#     Note: MMS needs onnxruntime-gpu; CPU ort has the same package name and silently
+#     drops CUDAExecutionProvider — see pyproject [tool.uv] override-dependencies.
+DEFAULT_ALIGN_MODELS = {"en": "facebook/wav2vec2-large-960h-lv60-self", "ja": "mms"}
+
+# Model cache layout: all weights go under VOXWEAVE_CACHE_ROOT (~/.cache/voxweave),
+# split by role (asr / align / audio). Each subdir is a self-contained HF hub tree
+# passed as cache_dir/download_root= to every model download.
+# Weights do NOT share with ~/.cache/huggingface/hub — a model already pulled by
+# `hf download` will re-download here on first run. This isolation is intentional:
+# it keeps the voxweave weight set self-contained for packaging/migration/deletion.
+CACHE_ROOT = Path(
+    os.environ.get("VOXWEAVE_CACHE_ROOT", str(Path.home() / ".cache" / "voxweave"))
+).expanduser()
+ASR_CACHE = str(CACHE_ROOT / "asr")  # Qwen ASR, faster-whisper
+ALIGN_CACHE = str(CACHE_ROOT / "align")  # Qwen aligner, en wav2vec2, ja MMS onnx
+AUDIO_CACHE = str(CACHE_ROOT / "audio")  # separator roformer, songdet PANNs
+
+_TEMPLATE = """\
+# voxweave configuration  (~/.config/voxweave.conf)
+# Precedence: CLI options > environment variables > this file > built-in defaults.
+# Remove a line to revert to the built-in default.
+
+# Default ASR model (= --model / env VOXWEAVE_ASR_MODEL); short name qwen3-asr-1.7B or full HF id.
+# Special value "hybrid" (= CLI --hybrid) -> dual-ASR fusion (whisper text quality + Qwen punctuation).
+# asr_model = "Qwen/Qwen3-ASR-0.6B"
+
+# Model load strategy (= env VOXWEAVE_LOAD_STRATEGY):
+#   peak (default) = serial peak-shaving: all-chunk ASR -> release -> all-chunk align;
+#                    ASR and aligner never co-reside; peak VRAM = max(each model); works on 8 GB cards.
+#   sum            = concurrent co-residence: per-chunk ASR+align in one pass;
+#                    peak VRAM = sum(models); saves two swap round-trips on large-VRAM cards.
+# load_strategy = "peak"
+
+# dual-ASR fusion sub-models (= CLI --hybrid; env VOXWEAVE_FUSION_WHISPER / VOXWEAVE_FUSION_QWEN).
+# whisper supplies accurate text, Qwen supplies punctuation positions (merged on a shared timeline).
+#   whisper = faster-whisper size: large-v3 (highest quality) | large-v3-turbo (~5x faster, default).
+#   qwen    = punctuation model; must emit punctuation so 1.7B (not 0.6B).
+[fusion]
+# whisper = "large-v3-turbo"
+# qwen = "Qwen/Qwen3-ASR-1.7B"
+
+# Per-language forced-alignment models; unlisted languages use Qwen3-ForcedAligner (built-in default).
+# Values: "mms" (MMS-300m + uroman, full-file single pass; bundled in core) |
+#         HF wav2vec2 id (downloaded to the voxweave align cache ~/.cache/voxweave/align) | torchaudio bundle name (-> torch.hub cache).
+# Set to "" to explicitly fall back to Qwen.  "mms" uses the full-file pass (immune to per-cue drift);
+# all other values use per-cue crop alignment.
+[align]
+en = "facebook/wav2vec2-large-960h-lv60-self"   # English: large wav2vec2 CTC per-cue, HF path -> ~/.cache/voxweave/align (same LV60K-self weights as torchaudio WAV2VEC2_ASR_LARGE_LV60K_960H bundle)
+ja = "mms"                             # Japanese: MMS-300m + uroman full-file single pass (= whisperx fork align_ctc; gold standard); requires onnxruntime-gpu for CUDA (bundled in core)
+# ja = "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"   # Alternative: xlsr character-level CTC per-cue (full-file single pass is O(T^2) -> OOM)
+# zh = "mms"   # Chinese can also use MMS full-file pass; default is Qwen (native CJK character-level)
+"""
+
+
+def config_path() -> Path:
+    """Config file path: ``VOXWEAVE_CONFIG`` env if set, else ``~/.config/voxweave.conf``."""
+    env = os.environ.get("VOXWEAVE_CONFIG")
+    return Path(env) if env else Path.home() / ".config" / "voxweave.conf"
+
+
+def _load() -> dict:
+    """Parse the config TOML. Missing or malformed file returns {} (no crash)."""
+    p = config_path()
+    if not p.exists():
+        return {}
+    try:
+        with p.open("rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        log.warning("config %s read failed (%r), treating as empty", p, e)
+        return {}
+
+
+# Legacy config path from when the tool was named "qsub"; auto-migrated on first run.
+_LEGACY_CONFIG = Path.home() / ".config" / "qsub.conf"
+
+
+def ensure_default_config() -> None:
+    """Write the default template on first run; no-op if the file already exists.
+
+    If ``~/.config/qsub.conf`` exists (pre-rename legacy config) and
+    ``VOXWEAVE_CONFIG`` is not set, migrate it in place instead of writing a fresh
+    template.
+    """
+    p = config_path()
+    if p.exists():
+        return
+    if not os.environ.get("VOXWEAVE_CONFIG") and _LEGACY_CONFIG.exists():
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _LEGACY_CONFIG.rename(p)
+            log.info("migrated legacy config %s -> %s", _LEGACY_CONFIG, p)
+            return
+        except OSError as e:
+            log.warning(
+                "could not migrate legacy config %s (%r), writing default",
+                _LEGACY_CONFIG,
+                e,
+            )
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_TEMPLATE, encoding="utf-8")
+        log.info("created default config %s", p)
+    except OSError as e:
+        log.warning("could not create default config %s (%r), ignoring", p, e)
+
+
+def conf_asr_model() -> str | None:
+    """ASR model from config; None if unset (caller falls back to env/built-in)."""
+    v = _load().get("asr_model")
+    return v if isinstance(v, str) and v.strip() else None
+
+
+def _conf_fusion(key: str) -> str | None:
+    """``[fusion].<key>`` from config, or None if absent/empty."""
+    fusion = _load().get("fusion")
+    if isinstance(fusion, dict):
+        v = fusion.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
+def conf_fusion_whisper() -> str:
+    """Fusion whisper sub-model (faster-whisper size string).
+    Precedence: env VOXWEAVE_FUSION_WHISPER > conf [fusion].whisper > default."""
+    v = os.environ.get("VOXWEAVE_FUSION_WHISPER") or _conf_fusion("whisper")
+    return v if isinstance(v, str) and v.strip() else DEFAULT_FUSION_WHISPER
+
+
+def conf_fusion_qwen() -> str:
+    """Fusion Qwen punctuation sub-model (must be 1.7B — 0.6B emits no punctuation).
+    Precedence: env VOXWEAVE_FUSION_QWEN > conf [fusion].qwen > default."""
+    v = os.environ.get("VOXWEAVE_FUSION_QWEN") or _conf_fusion("qwen")
+    return v if isinstance(v, str) and v.strip() else DEFAULT_FUSION_QWEN
+
+
+_LOAD_STRATEGIES = ("peak", "sum")
+
+
+def conf_load_strategy() -> str:
+    """Model load strategy.
+
+    - ``"peak"`` (default): serial peak-shaving — ASR and aligner never co-reside;
+      peak VRAM = max(each model). Works on 8 GB cards.
+    - ``"sum"``: concurrent co-residence — per-chunk ASR+align; peak VRAM = sum(models).
+      Saves swap overhead on large-VRAM cards.
+
+    Precedence: env VOXWEAVE_LOAD_STRATEGY > conf load_strategy > "peak". Invalid
+    values fall back to "peak".
+    """
+    v = os.environ.get("VOXWEAVE_LOAD_STRATEGY") or _load().get("load_strategy")
+    v = v.strip().lower() if isinstance(v, str) else ""
+    return v if v in _LOAD_STRATEGIES else "peak"
+
+
+def align_model_for(iso: str) -> str | None:
+    """Forced-alignment model for ``iso``. None → use Qwen default.
+
+    Config ``[align]`` takes precedence (set to "" to explicitly revert to Qwen);
+    falls back to DEFAULT_ALIGN_MODELS, then None.
+    """
+    align = _load().get("align")
+    if isinstance(align, dict) and iso in align:
+        v = align[iso]
+        return v if isinstance(v, str) and v.strip() else None
+    return DEFAULT_ALIGN_MODELS.get(iso)
+
+
+# Gap-aware segmentation thresholds (env > built-in).
+_JA_GAP_MULT = 1.4  # ja inter-sentence gaps run larger; scale clause_ms and offline_ms
+_GAP_DEFAULTS = {"clause_ms": 400, "vad_skip_ms": 1000, "offline_ms": 700}
+_MIN_CUE_DEFAULT = 0.5
+_MAX_CUE_DEFAULT = 7.0
+_MIN_CUE_CEIL = 5.0 / 6.0  # Netflix floor: never require longer than 5/6s
+_GLUE_GAP_DEFAULT_MS = 300  # lone-word flicker cue glues back if gap < this (0=off); < clause_ms so real pauses never merge
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    try:
+        return int(v) if v is not None and v.strip() else default
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    try:
+        return float(v) if v is not None and v.strip() else default
+    except ValueError:
+        return default
+
+
+def gap_thresholds(iso: str) -> dict[str, int | float]:
+    """Gap/duration thresholds for ``iso``. ja gets _JA_GAP_MULT on clause/offline.
+    ``min_cue_s`` is clamped to <=5/6s (Netflix floor)."""
+    mult = _JA_GAP_MULT if iso == "ja" else 1.0
+    clause = _env_int(
+        "VOXWEAVE_GAP_CLAUSE_MS", round(_GAP_DEFAULTS["clause_ms"] * mult)
+    )
+    skip = _env_int("VOXWEAVE_GAP_VAD_SKIP_MS", _GAP_DEFAULTS["vad_skip_ms"])
+    offline = _env_int(
+        "VOXWEAVE_GAP_OFFLINE_MS", round(_GAP_DEFAULTS["offline_ms"] * mult)
+    )
+    min_cue = min(
+        _env_float("VOXWEAVE_SEG_MIN_CUE_SEC", _MIN_CUE_DEFAULT), _MIN_CUE_CEIL
+    )  # distinct from pipeline's VOXWEAVE_MIN_CUE_SEC (align-stage floor); orthogonal knobs
+    max_cue = _env_float(
+        "VOXWEAVE_MAX_CUE_SEC", _MAX_CUE_DEFAULT
+    )  # intentionally unclamped
+    glue_gap = _env_int("VOXWEAVE_GLUE_GAP_MS", _GLUE_GAP_DEFAULT_MS) / 1000.0
+    return {
+        "clause_ms": clause,
+        "vad_skip_ms": skip,
+        "offline_ms": offline,
+        "min_cue_s": min_cue,
+        "max_cue_s": max_cue,
+        "glue_gap_s": glue_gap,
+    }

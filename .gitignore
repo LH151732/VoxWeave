@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+debug/
+cache/
+
+TODO.md
+
+# 私有项目说明, 不入库
+CLAUDE.md

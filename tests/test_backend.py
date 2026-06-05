@@ -1,0 +1,1075 @@
+"""backend pure-logic tests + missing-dependency error paths (no real model loading)."""
+
+import pytest
+
+from voxweave import backend
+
+
+def test_strip_state_dict_unwraps_and_deprefixes():
+    # Lightning wraps with a state_dict layer + model. prefix; both should be stripped
+    sd = {"state_dict": {"model.a": 1, "model.b": 2}}
+    assert backend._strip_state_dict(sd) == {"a": 1, "b": 2}
+
+
+def test_strip_state_dict_plain_passthrough():
+    assert backend._strip_state_dict({"a": 1, "b": 2}) == {"a": 1, "b": 2}
+
+
+def test_transcribe_align_missing_models_raises_friendly(tmp_path):
+    # qwen-asr not installed in this test env -> friendly RuntimeError pointing to voxweave[qwen], not bare ModuleNotFoundError
+    backend._asr = None  # ensure not loaded
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match=r"voxweave\[qwen\]"):
+        backend.transcribe_align(wav, language=None, asr_model="qwen3-asr-1.7b")
+
+
+def test_transcribe_align_forwards_context(monkeypatch, tmp_path):
+    # --context bias: when non-empty, forwarded to model.transcribe(context=...); ASR-only so return_time_stamps=False
+    calls: dict = {}
+
+    class _Res:
+        text, language, time_stamps = "hi", "English", None
+
+    class _Model:
+        def transcribe(self, path, **kw):
+            calls.update(kw)
+            return [_Res()]
+
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _Model())
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, lng: [{"text": "hi", "start": 0, "end": 1}]
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    backend.transcribe_align(
+        wav, None, asr_model="qwen3-asr-1.7b", context="艾米莉亚, 帕克"
+    )
+    assert calls.get("context") == "艾米莉亚, 帕克"
+    assert (
+        calls.get("return_time_stamps") is False
+    )  # ASR-only, built-in aligner not requested
+
+
+def test_transcribe_align_omits_context_when_empty(monkeypatch, tmp_path):
+    # no context -> kwarg is omitted entirely; preserves legacy behavior (older qwen-asr lacks this param)
+    calls: dict = {}
+
+    class _Res:
+        text, language, time_stamps = "hi", "English", None
+
+    class _Model:
+        def transcribe(self, path, **kw):
+            calls.update(kw)
+            return [_Res()]
+
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _Model())
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, lng: [{"text": "hi", "start": 0, "end": 1}]
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    backend.transcribe_align(wav, None, asr_model="qwen3-asr-1.7b")
+    assert "context" not in calls
+
+
+def test_qwen_align_routes_all_langs_through_align_text(monkeypatch, tmp_path):
+    # ASR no longer loads the built-in aligner -> all languages get timestamps from align_text (ja/en CTC, zh falls back internally to Qwen);
+    # ASR call must use return_time_stamps=False (no built-in aligner; True would raise ValueError)
+    class _Res:
+        text, language, time_stamps = "はい", "Japanese", None  # no built-in units
+
+    class _Model:
+        def transcribe(self, path, **kw):
+            assert kw.get("return_time_stamps") is False
+            return [_Res()]
+
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _Model())
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    seen: dict = {}
+
+    def _fake_align(wav, text, lang):
+        seen.update(text=text, lang=lang)
+        return [{"text": "はい", "start": 33.6, "end": 33.9}]
+
+    monkeypatch.setattr(backend, "align_text", _fake_align)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    lang, text, units = backend.transcribe_align(wav, None, asr_model="qwen3-asr-1.7b")
+    assert lang == "Japanese" and text == "はい"
+    assert units == [{"text": "はい", "start": 33.6, "end": 33.9}]
+    assert seen == {"text": "はい", "lang": "Japanese"}
+
+
+def test_qwen_align_empty_text_skips_align(monkeypatch, tmp_path):
+    # empty text -> align_text is not called; return empty directly (consistent with whisper path)
+    class _Res:
+        text, language, time_stamps = "", "Japanese", None
+
+    class _Model:
+        def transcribe(self, path, **kw):
+            return [_Res()]
+
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _Model())
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+
+    def _boom(*a, **k):
+        raise AssertionError("align_text should not be called on empty text")
+
+    monkeypatch.setattr(backend, "align_text", _boom)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    assert backend.transcribe_align(wav, None, asr_model="qwen3-asr-1.7b") == (
+        "Japanese",
+        "",
+        [],
+    )
+
+
+def test_align_text_missing_models_raises_friendly(tmp_path):
+    # qwen-asr not installed -> align_text also raises a friendly RuntimeError pointing to voxweave[qwen]
+    backend._aligner = None
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match=r"voxweave\[qwen\]"):
+        backend.align_text(wav, "你好", "zh")
+
+
+def test_to_iso3_mapping():
+    # ctc-forced-aligner / uroman uses ISO-639-3; zh->chi (library checks ["jpn","chi"] to force per-char mode)
+    assert backend._to_iso3("ja") == "jpn"
+    assert backend._to_iso3("zh") == "chi"
+    assert backend._to_iso3("en") == "eng"
+    assert (
+        backend._to_iso3("xyz") == "xyz"
+    )  # no mapping (already 3-letter) -> pass through unchanged
+
+
+def test_uses_mms_ja_yes_en_no(monkeypatch):
+    models = {"ja": "mms", "en": "WAV2VEC2_ASR_LARGE_LV60K_960H"}
+    monkeypatch.setattr(backend.config, "align_model_for", lambda iso: models.get(iso))
+    assert backend.uses_mms("ja") is True
+    assert backend.uses_mms("en") is False  # wav2vec2, not MMS
+    assert backend.uses_mms("zh") is False  # None (goes to Qwen)
+
+
+def test_align_text_routes_ja_to_mms(monkeypatch, tmp_path):
+    # ja + config "mms" -> align_text routes to align_text_mms; align_text_ctc must not be called
+    monkeypatch.setattr(
+        backend.config, "align_model_for", lambda iso: "mms" if iso == "ja" else None
+    )
+    seen: dict = {}
+    monkeypatch.setattr(
+        backend,
+        "align_text_mms",
+        lambda w, t, iso: (
+            seen.update(t=t, iso=iso) or [{"text": "は", "start": 0.0, "end": 0.1}]
+        ),
+    )
+
+    def _no_ctc(*a):
+        raise AssertionError("ja(mms) should not route to align_text_ctc")
+
+    monkeypatch.setattr(backend, "align_text_ctc", _no_ctc)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    units = backend.align_text(wav, "はい", "Japanese")
+    assert units == [{"text": "は", "start": 0.0, "end": 0.1}]
+    assert seen == {"t": "はい", "iso": "ja"}
+
+
+def test_align_blocks_full_mms_distributes_by_alnum(monkeypatch, tmp_path):
+    # full-audio single pass -> slice flat units back by alnum char count per block (punctuation/spaces not counted)
+    monkeypatch.setattr(backend, "_read_wav_16k", lambda p: "WAV")
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    flat = [
+        {"text": c, "start": float(i), "end": i + 0.5} for i, c in enumerate("ABCDE")
+    ]
+
+    def _emit(wav, text, iso):
+        assert wav == "WAV" and iso == "ja"
+        return flat
+
+    monkeypatch.setattr(backend, "_mms_emit_units", _emit)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    out = backend.align_blocks_full_mms(wav, ["AB", "C。", "D E"], "ja")
+    assert [len(b) for b in out] == [2, 1, 2]  # punctuation/spaces not counted as alnum
+    assert out[0] == flat[0:2] and out[1] == flat[2:3] and out[2] == flat[3:5]
+
+
+def test_distribute_units_nospace_vs_spaced():
+    flat = [{"text": str(i), "start": float(i), "end": i + 1.0} for i in range(5)]
+    # no-space language: by alnum char count (punctuation/spaces not counted)
+    out = backend._distribute_units(flat, ["AB", "C。", "D E"], "ja")
+    assert [len(b) for b in out] == [2, 1, 2]
+    # spaced language: by word count
+    out2 = backend._distribute_units(flat, ["a b", "c", "d e"], "en")
+    assert [len(b) for b in out2] == [2, 1, 2]
+
+
+def test_release_clears_aligner():
+    backend._aligner = object()  # pretend it is loaded
+    backend.release()
+    assert backend._aligner is None
+
+
+def test_resolve_separator_uses_existing_files(monkeypatch, tmp_path):
+    # explicit ckpt + yaml both present -> use directly, no download triggered
+    ck = tmp_path / "x.ckpt"
+    cf = tmp_path / "x.yaml"
+    ck.write_bytes(b"w")
+    cf.write_text("model: {}\n")
+    monkeypatch.setattr(backend, "SEPARATOR_CKPT", str(ck))
+    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", str(cf))
+
+    def _boom(*a, **k):
+        raise AssertionError("should not download")
+
+    monkeypatch.setattr(backend, "_hf_download", _boom)
+    rck, rcf = backend._resolve_separator_files()
+    assert rck == ck and rcf == cf
+
+
+def test_resolve_separator_downloads_missing_ckpt(monkeypatch, tmp_path):
+    # ckpt missing -> download from HF, return cached path; yaml present -> use it as-is
+    cf = tmp_path / "x.yaml"
+    cf.write_text("model: {}\n")
+    cached = tmp_path / "hf" / "MelBandRoformer.ckpt"
+    cached.parent.mkdir()
+    cached.write_bytes(b"w")
+    monkeypatch.setattr(backend, "SEPARATOR_CKPT", "/nonexistent/x.ckpt")
+    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", str(cf))
+    calls = []
+
+    def _dl(repo, fn, cache_dir=None):
+        calls.append((repo, fn, cache_dir))
+        return str(cached)
+
+    monkeypatch.setattr(backend, "_hf_download", _dl)
+    rck, rcf = backend._resolve_separator_files()
+    assert rck == cached and rcf == cf
+    # separator weights download into the voxweave audio cache subdir
+    assert calls == [
+        (backend.SEPARATOR_REPO, backend.SEPARATOR_REPO_FILE, backend.config.AUDIO_CACHE)
+    ]
+
+
+def test_resolve_separator_falls_back_to_bundled_config(monkeypatch, tmp_path):
+    # yaml missing -> fall back to the vendor-bundled config (must exist and be parseable)
+    ck = tmp_path / "x.ckpt"
+    ck.write_bytes(b"w")
+    monkeypatch.setattr(backend, "SEPARATOR_CKPT", str(ck))
+    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", "/nonexistent/x.yaml")
+    rck, rcf = backend._resolve_separator_files()
+    assert rck == ck
+    assert rcf == backend._BUNDLED_SEPARATOR_CONFIG
+    assert rcf.exists()
+    cfg = backend._load_yaml(rcf)
+    assert cfg["model"]["dim"] == 384 and cfg["model"]["num_bands"] == 60
+
+
+def test_resolve_separator_download_failure_raises_friendly(monkeypatch):
+    # download fails -> friendly RuntimeError (mentions --no-separate / manual weight placement), not bare exception
+    monkeypatch.setattr(backend, "SEPARATOR_CKPT", "/nonexistent/x.ckpt")
+    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", "/nonexistent/x.yaml")
+
+    def _dl(repo, fn):
+        raise OSError("no network")
+
+    monkeypatch.setattr(backend, "_hf_download", _dl)
+    with pytest.raises(RuntimeError, match="--no-separate"):
+        backend._resolve_separator_files()
+
+
+def test_release_is_idempotent():
+    backend._asr = None
+    backend.release()  # must not crash when nothing is loaded
+    assert backend._asr is None
+
+
+def test_demix_reports_progress_per_window():
+    # _demix overlap-add window loop is countable -> progress(done, total) called per window, for real progress bars
+    torch = pytest.importorskip("torch")
+
+    class _Identity(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(
+            self, x
+        ):  # x: [1, ch, chunk] -> pass through unchanged (sufficient to test progress counting)
+            return x
+
+    cfg = {"audio": {"chunk_size": 16}, "inference": {"num_overlap": 4}}
+    mix = torch.zeros(2, 40)  # step=16//4=4, range(0,40,4) -> 10 windows
+    calls: list[tuple[int, int]] = []
+    backend._demix(_Identity(), mix, cfg, progress=lambda d, t: calls.append((d, t)))
+    assert len(calls) == 10
+    assert calls[0] == (1, 10) and calls[-1] == (10, 10)
+    assert [d for d, _ in calls] == list(range(1, 11))  # monotonically increasing
+
+
+def test_resolve_asr_model():
+    assert backend.resolve_asr_model(None) == backend.ASR_MODEL
+    assert backend.resolve_asr_model("") == backend.ASR_MODEL
+    # short name (case-insensitive) -> canonical HF id
+    assert backend.resolve_asr_model("qwen3-asr-1.7B") == "Qwen/Qwen3-ASR-1.7B"
+    assert backend.resolve_asr_model("1.7b") == "Qwen/Qwen3-ASR-1.7B"
+    # full id passes through unchanged
+    assert backend.resolve_asr_model("Qwen/Qwen3-ASR-0.6B") == "Qwen/Qwen3-ASR-0.6B"
+    # unknown bare name falls back to prepending org
+    assert backend.resolve_asr_model("my-asr") == "Qwen/my-asr"
+
+
+def test_select_engine_routes_whisper_names():
+    assert backend._select_engine("large-v3-turbo") == ("whisper", "large-v3-turbo")
+    assert backend._select_engine("large-v3") == ("whisper", "large-v3")
+    assert backend._select_engine("distil-large-v3") == ("whisper", "distil-large-v3")
+    # aliases: turbo / whisper -> canonical large-v3-turbo
+    assert backend._select_engine("turbo") == ("whisper", "large-v3-turbo")
+    assert backend._select_engine("whisper") == ("whisper", "large-v3-turbo")
+    # case-insensitive
+    assert backend._select_engine("Large-V3-Turbo") == ("whisper", "large-v3-turbo")
+
+
+def test_select_engine_default_is_qwen():
+    # default = historical Qwen (fusion is opt-in, triggered by CLI --hybrid)
+    assert backend._select_engine(None) == ("qwen", backend.ASR_MODEL)
+    assert backend._select_engine("") == ("qwen", backend.ASR_MODEL)
+
+
+def test_select_engine_fusion_aliases():
+    # --hybrid sets asr_model to "fusion"; 'fuse' is also recognized
+    assert backend._select_engine("fusion") == ("fusion", "")
+    assert backend._select_engine("Fuse") == ("fusion", "")
+    # config asr_model = "hybrid" is equivalent to CLI --hybrid (both route to fusion)
+    assert backend._select_engine("hybrid") == ("fusion", "")
+    assert backend._select_engine("Hybrid") == ("fusion", "")
+
+
+def test_select_engine_routes_qwen_named():
+    # explicit Qwen (e.g. for Chinese) still routes to qwen
+    assert backend._select_engine("qwen3-asr-1.7B") == ("qwen", "Qwen/Qwen3-ASR-1.7B")
+    assert backend._select_engine("Qwen/Qwen3-ASR-0.6B") == (
+        "qwen",
+        "Qwen/Qwen3-ASR-0.6B",
+    )
+    # unknown repo containing '/' -> qwen, pass through unchanged
+    assert backend._select_engine("openai/whatever") == ("qwen", "openai/whatever")
+
+
+def test_transcribe_align_routes_fusion(monkeypatch, tmp_path):
+    # default (asr_model=None) -> _transcribe_fusion
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    called = {}
+
+    def _fake_fusion(wav_path, language, context):
+        called["fusion"] = True
+        return "ja", "畑です。", [{"text": "畑", "start": 0.0, "end": 0.2}]
+
+    monkeypatch.setattr(backend, "_transcribe_fusion", _fake_fusion)
+    lang, text, units = backend.transcribe_align(wav, None, asr_model="fusion")
+    assert called.get("fusion") and lang == "ja" and text == "畑です。"
+
+
+def test_fusion_merges_whisper_text_with_qwen_punct(monkeypatch, tmp_path):
+    # whisper produces accurate words without punctuation, Qwen produces punctuation positions -> fused text = whisper words + Qwen punctuation
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    w_units = [
+        {"text": "畑", "start": 1.0, "end": 1.2},
+        {"text": "です", "start": 1.2, "end": 1.6},
+        {"text": "次", "start": 2.5, "end": 2.7},
+    ]
+    # Qwen path: text has punctuation, units are aligner output (no punctuation) -> after reinject, punctuation carries timestamps
+    monkeypatch.setattr(
+        backend,
+        "_transcribe_whisper_align",
+        lambda *a, **k: ("ja", "畑です次", w_units),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_transcribe_qwen_align",
+        lambda *a, **k: (
+            "Japanese",
+            "裸です。次。",
+            [
+                {"text": "裸", "start": 1.0, "end": 1.2},
+                {"text": "で", "start": 1.2, "end": 1.4},
+                {"text": "す", "start": 1.4, "end": 1.6},
+                {"text": "次", "start": 2.5, "end": 2.7},
+            ],
+        ),
+    )
+    lang, text, units = backend._transcribe_fusion(wav, None, None)
+    assert "。" in text  # Qwen punctuation is present
+    assert "畑" in text and "裸" not in text  # text is from whisper (畑, not 裸)
+    assert units == w_units  # units come from whisper
+
+
+def test_transcribe_chunks_fusion_three_pass_order(monkeypatch, tmp_path):
+    # fusion three-pass: all-chunks whisper ASR -> release whisper -> all-chunks Qwen ASR -> release Qwen ->
+    # all-chunks align (only CTC resident at this point; whisper/Qwen both released -> fixes Qwen+CTC co-resident OOM on 8GB cards)
+    seq: list[str] = []
+
+    def _asr(engine, w, lang, mid, ctx):
+        seq.append(f"asr:{engine}:{w.name}")
+        return ("ja", f"{engine}-{w.name}", "ja")
+
+    def _align(w, text, alang):
+        seq.append(f"align:{text}")
+        return [{"text": "x", "start": 0.0, "end": 0.2}]
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(backend, "align_text", _align)
+    monkeypatch.setattr(
+        backend, "_fuse_chunk", lambda wr, qr, lang: ("ja", "fused", [])
+    )
+    monkeypatch.setattr(backend, "_release_whisper", lambda: seq.append("REL_W"))
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: seq.append("REL_Q"))
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    ticks: list[int] = []
+    out = backend.transcribe_chunks(
+        wavs, None, asr_model="fusion", on_done=lambda i: ticks.append(i)
+    )
+    # all whisper ASR -> release -> all Qwen ASR -> release -> all align (each chunk aligned once for whisper text + once for Qwen text)
+    assert seq == [
+        "asr:whisper:c0.wav",
+        "asr:whisper:c1.wav",
+        "REL_W",
+        "asr:qwen:c0.wav",
+        "asr:qwen:c1.wav",
+        "REL_Q",
+        "align:whisper-c0.wav",
+        "align:qwen-c0.wav",
+        "align:whisper-c1.wav",
+        "align:qwen-c1.wav",
+    ]
+    assert len(out) == 2 and ticks == [0, 1, 2, 3, 4, 5]  # 3N=6 progress ticks
+
+
+def test_transcribe_chunks_non_fusion_two_pass_order(monkeypatch, tmp_path):
+    # non-fusion (qwen/whisper) also two-pass: all-chunks ASR -> release ASR -> all-chunks align (peak = max not sum;
+    # ASR singleton and aligner no longer co-reside -> fixes OOM on 8GB cards)
+    seq: list[str] = []
+
+    def _asr(engine, w, lang, mid, ctx):
+        seq.append(f"asr:{w.name}")
+        return ("Japanese", "はい", "ja")
+
+    def _align(w, text, alang):
+        seq.append(f"align:{w.name}")
+        return [{"text": "はい", "start": 0.0, "end": 1.0}]
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(backend, "align_text", _align)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: seq.append("REL_ASR"))
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    ticks: list[int] = []
+    out = backend.transcribe_chunks(
+        wavs, None, asr_model="qwen3-asr-1.7b", on_done=lambda i: ticks.append(i)
+    )
+    assert seq == [
+        "asr:c0.wav",
+        "asr:c1.wav",
+        "REL_ASR",
+        "align:c0.wav",
+        "align:c1.wav",
+    ]
+    assert len(out) == 2 and ticks == [0, 1, 2, 3]  # 2N progress ticks
+    assert out[0] == ("Japanese", "はい", [{"text": "はい", "start": 0.0, "end": 1.0}])
+
+
+def test_transcribe_chunks_two_pass_releases_whisper_for_whisper_engine(
+    monkeypatch, tmp_path
+):
+    # whisper engine: after the ASR pass, whisper singleton is released (not qwen)
+    rel: list[str] = []
+    monkeypatch.setattr(
+        backend, "_asr_only", lambda e, w, lang, m, c: ("ja", "x", "ja")
+    )
+    monkeypatch.setattr(backend, "align_text", lambda w, t, a: [{"text": "x"}])
+    monkeypatch.setattr(backend, "_release_whisper", lambda: rel.append("W"))
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: rel.append("Q"))
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wav = tmp_path / "c0.wav"
+    wav.write_bytes(b"x")
+    backend.transcribe_chunks([wav], None, asr_model="large-v3-turbo")
+    assert rel == ["W"]  # whisper engine releases whisper, does not touch qwen
+
+
+def test_transcribe_chunks_two_pass_skips_align_for_empty_text(monkeypatch, tmp_path):
+    # empty ASR text chunk: second pass skips alignment, units stay []
+    def _asr(engine, w, lang, mid, ctx):
+        return ("ja", "" if w.name == "c1.wav" else "はい", "ja")
+
+    aligned: list[str] = []
+
+    def _align(w, text, alang):
+        aligned.append(w.name)
+        return [{"text": "はい", "start": 0.0, "end": 1.0}]
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(backend, "align_text", _align)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    out = backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
+    assert aligned == ["c0.wav"]  # c1 empty text -> not aligned
+    assert out[1] == ("ja", "", [])
+
+
+# --- load strategy: sum (parallel co-resident, per-chunk transcribe_align) ---------------------- #
+def test_transcribe_chunks_sum_strategy_per_chunk(monkeypatch, tmp_path):
+    # sum: per-chunk transcribe_align (ASR+alignment co-resident inline), no two passes, N ticks, no ASR release interleaved
+    seq: list[str] = []
+
+    def _ta(w, lang, asr_model=None, context=None):
+        seq.append(f"chunk:{w.name}")
+        return ("Japanese", "はい", [{"text": "はい", "start": 0.0, "end": 1.0}])
+
+    monkeypatch.setattr(backend, "transcribe_align", _ta)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: seq.append("REL"))
+    monkeypatch.setattr(backend, "_release_whisper", lambda: seq.append("RELW"))
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    ticks: list[int] = []
+    out = backend.transcribe_chunks(
+        wavs,
+        None,
+        asr_model="qwen3-asr-1.7b",
+        on_done=lambda i: ticks.append(i),
+        strategy="sum",
+    )
+    assert seq == [
+        "chunk:c0.wav",
+        "chunk:c1.wav",
+    ]  # per-chunk, no two-pass or REL interleaved
+    assert len(out) == 2 and ticks == [0, 1]  # N (not 2N)
+    assert out[0] == ("Japanese", "はい", [{"text": "はい", "start": 0.0, "end": 1.0}])
+
+
+def test_transcribe_chunks_default_strategy_is_peak(monkeypatch, tmp_path):
+    # omitting strategy -> peak (two-pass, 2N ticks); default must not change
+    monkeypatch.setattr(
+        backend, "_asr_only", lambda e, w, lang, m, c: ("ja", "x", "ja")
+    )
+    monkeypatch.setattr(backend, "align_text", lambda w, t, a: [{"text": "x"}])
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    ticks: list[int] = []
+    backend.transcribe_chunks(
+        wavs, None, asr_model="qwen3-asr-1.7b", on_done=lambda i: ticks.append(i)
+    )
+    assert ticks == [0, 1, 2, 3]  # 2N = peak default
+
+
+def test_chunk_pass_count():
+    assert backend.chunk_pass_count("qwen3-asr-1.7b", "peak") == 2
+    assert backend.chunk_pass_count("fusion", "peak") == 3
+    assert backend.chunk_pass_count("qwen3-asr-1.7b", "sum") == 1
+    assert backend.chunk_pass_count("fusion", "sum") == 1
+
+
+def test_get_whisper_missing_dep_raises_friendly():
+    # faster-whisper not installed in this test env -> friendly RuntimeError pointing to voxweave[whisper]
+    backend._whisper = None
+    with pytest.raises(RuntimeError, match=r"voxweave\[whisper\]"):
+        backend._get_whisper("large-v3-turbo")
+
+
+def test_release_clears_whisper(monkeypatch):
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    backend._whisper = object()
+    backend._whisper_id = "large-v3-turbo"
+    backend.release()
+    assert backend._whisper is None
+    assert backend._whisper_id is None
+
+
+def test_parse_whisper_device_splits_cuda_index(monkeypatch):
+    monkeypatch.setattr(backend, "DEVICE", "cuda:0")
+    assert backend._parse_whisper_device() == ("cuda", 0)
+    monkeypatch.setattr(backend, "DEVICE", "cuda:1")
+    assert backend._parse_whisper_device() == ("cuda", 1)
+    monkeypatch.setattr(backend, "DEVICE", "cpu")
+    assert backend._parse_whisper_device() == ("cpu", 0)
+
+
+def _fake_whisper(segs, lang):
+    """Fake WhisperModel: .transcribe returns (segment iterator, info); records kwargs to .calls."""
+
+    class _Seg:
+        def __init__(self, text):
+            self.text = text
+
+    class _Info:
+        def __init__(self, language):
+            self.language = language
+
+    class _Model:
+        def __init__(self):
+            self.calls: dict = {}
+
+        def transcribe(self, path, **kw):
+            self.calls.update(kw)
+            return iter([_Seg(t) for t in segs]), _Info(lang)
+
+    return _Model()
+
+
+def test_whisper_align_basic_returns_contract(monkeypatch, tmp_path):
+    model = _fake_whisper(["Hello", " world"], "en")
+    align_calls: dict = {}
+
+    def _fake_align(wav, text, lang):
+        align_calls.update(text=text, lang=lang)
+        return [{"text": "hello", "start": 0.0, "end": 1.0}]
+
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
+    monkeypatch.setattr(backend, "align_text", _fake_align)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    lang, text, units = backend.transcribe_align(wav, None, asr_model="large-v3-turbo")
+    assert lang == "en"
+    assert text == "Hello world"
+    assert units == [{"text": "hello", "start": 0.0, "end": 1.0}]
+    assert align_calls == {"text": "Hello world", "lang": "en"}
+    # verify: language=None is passed through to whisper
+    assert model.calls.get("language") is None
+    assert model.calls.get("word_timestamps") is False
+
+
+def test_whisper_align_override_language_maps_to_iso(monkeypatch, tmp_path):
+    model = _fake_whisper(["こんにちは"], "ja")
+    align_calls: dict = {}
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda w, t, lng: (
+            align_calls.update(lang=lng) or [{"text": "x", "start": 0, "end": 1}]
+        ),
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    backend.transcribe_align(wav, "japanese", asr_model="large-v3")
+    # whisper language= receives iso, alignment receives the override full name
+    assert model.calls.get("language") == "ja"
+    assert align_calls.get("lang") == "japanese"
+
+
+def test_whisper_align_unsupported_lang_falls_back_to_en(monkeypatch, tmp_path):
+    model = _fake_whisper(
+        ["bonjour"], "th"
+    )  # Thai is not in the aligner's 11 supported languages
+    align_calls: dict = {}
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda w, t, lng: (
+            align_calls.update(lang=lng) or [{"text": "x", "start": 0, "end": 1}]
+        ),
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    lang, text, units = backend.transcribe_align(wav, None, asr_model="large-v3")
+    assert lang == "th"  # detected language returned as-is
+    assert align_calls.get("lang") == "en"  # alignment falls back to en
+
+
+def test_whisper_align_context_maps_to_initial_prompt(monkeypatch, tmp_path):
+    model = _fake_whisper(["hi"], "en")
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, lng: [{"text": "hi", "start": 0, "end": 1}]
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    backend.transcribe_align(wav, None, asr_model="large-v3", context="艾米莉亚")
+    assert model.calls.get("initial_prompt") == "艾米莉亚"
+
+
+def test_whisper_align_empty_text_skips_alignment(monkeypatch, tmp_path):
+    model = _fake_whisper([], "en")  # no segments -> empty text
+
+    def _boom(*a, **k):
+        raise AssertionError("align_text should not be called on empty text")
+
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
+    monkeypatch.setattr(backend, "align_text", _boom)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    lang, text, units = backend.transcribe_align(wav, None, asr_model="large-v3")
+    assert (lang, text, units) == ("en", "", [])
+
+
+def test_whisper_align_cantonese_uses_zh_for_whisper(monkeypatch, tmp_path):
+    # whisper has no Cantonese code: --language yue -> whisper receives zh, but alignment still receives yue
+    model = _fake_whisper(["你好"], "zh")
+    align_calls: dict = {}
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda w, t, lng: (
+            align_calls.update(lang=lng) or [{"text": "x", "start": 0, "end": 1}]
+        ),
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    backend.transcribe_align(wav, "yue", asr_model="large-v3")
+    assert model.calls.get("language") == "zh"
+    assert align_calls.get("lang") == "yue"
+
+
+def test_transcribe_align_whisper_missing_dep_raises_friendly(tmp_path):
+    # select whisper engine via the public transcribe_align entry point; faster-whisper not installed -> friendly voxweave[whisper] error
+    backend._whisper = None
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match=r"voxweave\[whisper\]"):
+        backend.transcribe_align(wav, None, asr_model="large-v3-turbo")
+
+
+# --------------------------------------------------------------------------- #
+# wav2vec2 CTC alignment (WhisperX-equivalent path; English default, per-language in voxweave.config)
+# --------------------------------------------------------------------------- #
+import collections  # noqa: E402
+
+_Span = collections.namedtuple("_Span", "token start end score")
+
+# simulated subset of wav2vec2 960h label set: 0='-'(blank), 1='|'(sep), last entry includes apostrophe
+_FAKE_LABELS = list("-|ETAONIHSRDLUMWCFGYPBVKJXQZ'")
+
+
+def _fake_invocab():
+    sep = _FAKE_LABELS.index("|")
+    return {c: i for i, c in enumerate(_FAKE_LABELS) if i not in (0, sep)}, sep
+
+
+def test_ctc_tokens_wordlevel_and_oov():
+    invocab, sep = _fake_invocab()
+    toks, meta, words = backend._ctc_tokens("Don't well-known cafe, 2", invocab, sep)
+    assert words == ["Don't", "well-known", "cafe,", "2"]
+    assert max(m for m in meta if m >= 0) == 3  # 4 words -> word_idx 0..3
+    assert 0 not in [
+        t for t in toks if t is not None
+    ]  # hyphen does not mis-hit blank(0)
+    # '-' in well-known (word_idx 1) is OOV -> None
+    assert any(t is None for t, m in zip(toks, meta) if m == 1)
+    # apostrophe is in invocab -> all chars in Don't have non-OOV tokens
+    assert all(t is not None for t, m in zip(toks, meta) if m == 0)
+
+
+def test_ctc_tokens_collapses_multispace_and_strips():
+    invocab, sep = _fake_invocab()
+    toks, meta, words = backend._ctc_tokens("  a   b  ", invocab, sep)
+    assert words == ["a", "b"] and max(m for m in meta if m >= 0) == 1
+    assert (
+        meta.count(-1) == 1
+    )  # exactly one separator between words (multiple spaces collapsed, leading/trailing stripped)
+
+
+def test_strip_trailing_punct():
+    assert backend._strip_trailing_punct("cafe,") == "cafe"
+    assert backend._strip_trailing_punct("dogs.") == "dogs"
+    assert backend._strip_trailing_punct("well-known") == "well-known"
+    assert backend._strip_trailing_punct("Don't") == "Don't"
+    assert (
+        backend._strip_trailing_punct("...") == "..."
+    )  # all punctuation -> return original
+
+
+def test_ctc_words_from_spans():
+    spans = [
+        _Span(5, 0, 2, 0.9),
+        _Span(6, 2, 4, 0.9),  # word0 "ab"
+        _Span(1, 4, 5, 0.5),  # sep (meta -1)
+        _Span(7, 6, 10, 0.9),  # word1 "cafe,"
+    ]
+    units = backend._ctc_words_from_spans(
+        spans, [0, 0, -1, 1], ["ab", "cafe,"], ratio=0.1
+    )
+    assert len(units) == 2
+    assert units[0] == {"text": "ab", "start": 0.0, "end": 0.4}
+    assert units[1] == {
+        "text": "cafe",
+        "start": 0.6,
+        "end": 1.0,
+    }  # trailing punctuation stripped; timing covers full word
+
+
+def test_align_text_dispatches_ctc_for_configured_lang(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        backend.config, "align_model_for", lambda iso: "WAV2VEC2_ASR_LARGE_LV60K_960H"
+    )
+    sentinel = [{"text": "hi", "start": 0.0, "end": 0.5}]
+    seen = {}
+
+    def _fake_ctc(wav, text, iso, model):
+        seen["args"] = (text, iso, model)
+        return sentinel
+
+    monkeypatch.setattr(backend, "align_text_ctc", _fake_ctc)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    out = backend.align_text(wav, "hi there", "en")
+    assert out is sentinel
+    assert seen["args"] == ("hi there", "en", "WAV2VEC2_ASR_LARGE_LV60K_960H")
+
+
+def test_align_text_ctc_failure_falls_back_to_qwen(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        backend.config, "align_model_for", lambda iso: "WAV2VEC2_ASR_LARGE_LV60K_960H"
+    )
+
+    def _boom(*a):
+        raise RuntimeError("ctc broke")
+
+    monkeypatch.setattr(backend, "align_text_ctc", _boom)
+    backend._aligner = None
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    # CTC fails -> falls back to Qwen -> qwen_asr absent -> friendly voxweave[qwen] error
+    with pytest.raises(RuntimeError, match=r"voxweave\[qwen\]"):
+        backend.align_text(wav, "hello there", "en")
+
+
+def test_align_text_qwen_for_unconfigured_lang(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend.config, "align_model_for", lambda iso: None)
+    backend._aligner = None
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    # no CTC configured (None) -> skip CTC -> Qwen path -> friendly error
+    with pytest.raises(RuntimeError, match=r"voxweave\[qwen\]"):
+        backend.align_text(wav, "你好", "zh")
+
+
+def test_release_clears_ctc(monkeypatch):
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    backend._ctc = object()
+    backend._ctc_lang = "en"
+    backend.release()
+    assert backend._ctc is None and backend._ctc_lang is None
+
+
+# --------------------------------------------------------------------------- #
+# Japanese (no-space) CTC: per-char tokenization + OOV interpolation fallback (Phase B)
+# --------------------------------------------------------------------------- #
+def test_ctc_tokens_nospace_basic():
+    vocab = {c: i for i, c in enumerate("私の学校はいええ")}
+    toks, meta, words = backend._ctc_tokens_nospace("私の学校", vocab)
+    assert words == ["私", "の", "学", "校"]
+    assert meta == [0, 1, 2, 3]  # per-char, no separator -1
+    assert all(t is not None for t in toks)
+
+
+def test_ctc_tokens_nospace_skips_punct_and_space():
+    vocab = {c: i for i, c in enumerate("はいええ")}
+    toks, meta, words = backend._ctc_tokens_nospace("はい。 ええ", vocab)
+    assert words == [
+        "は",
+        "い",
+        "え",
+        "え",
+    ]  # 。 and space are skipped, do not become tokens/units
+    assert meta == [0, 1, 2, 3]
+    assert len(toks) == 4
+
+
+def test_ctc_tokens_nospace_oov_keeps_char():
+    vocab = {c: i for i, c in enumerate("私の")}  # 学/校 not in vocab -> OOV
+    toks, meta, words = backend._ctc_tokens_nospace("私の学校", vocab)
+    assert words == [
+        "私",
+        "の",
+        "学",
+        "校",
+    ]  # OOV chars still enter words, no character dropped
+    assert toks[2] is None and toks[3] is None  # 学/校 OOV -> None (wildcard path)
+    assert meta == [0, 1, 2, 3]
+
+
+def test_ctc_tokens_nospace_no_casing_on_latin():
+    # critical invariant: no .lower()/.upper() (xlsr-ja vocab has uppercase A/C/P only; lowercasing would make them OOV)
+    vocab = {"A": 10, "C": 11, "P": 12, "私": 13}
+    toks, _, words = backend._ctc_tokens_nospace("A私", vocab)
+    assert words == ["A", "私"]
+    assert toks == [
+        10,
+        13,
+    ]  # A hits directly without case-folding; .lower() would turn it into OOV
+
+
+def test_interp_missing_monotonic():
+    units = [
+        {"text": "a", "start": 1.0, "end": 1.5},
+        {
+            "text": "b",
+            "start": 2.0,
+            "end": 2.0,
+        },  # zero-length -> interpolate from both anchors
+        {"text": "c", "start": 3.0, "end": 3.5},
+    ]
+    out = backend.interp_missing(units)
+    assert len(out) == 3
+    assert 1.5 <= out[1]["start"] <= 3.0 and out[1]["start"] <= out[1]["end"]
+
+
+def test_interp_missing_single_anchor():
+    units = [
+        {"text": "a", "start": 1.0, "end": 1.5},
+        {"text": "b", "start": 0.0, "end": 0.0},  # only forward anchor -> ffill
+    ]
+    out = backend.interp_missing(units)
+    assert out[1]["start"] == 1.5
+
+
+def test_interp_missing_all_invalid_noop():
+    units = [{"text": "a", "start": 0.0, "end": 0.0}]
+    out = backend.interp_missing(units)
+    assert (
+        len(out) == 1 and out == units
+    )  # no anchors -> return unchanged without crashing
+
+
+def test_interp_missing_no_unit_lost():
+    units = [
+        {"text": "a", "start": 0.0, "end": 0.0},
+        {"text": "b", "start": 1.0, "end": 1.5},
+        {"text": "c", "start": 2.0, "end": 2.0},
+    ]
+    out = backend.interp_missing(units)
+    assert len(out) == len(units)  # never drops a unit
+
+
+# --------------------------------------------------------------------------- #
+# _get_ctc_aligner structural regression (CtcAligner namedtuple; both bundle and HF paths unpacked, no real model)
+# --------------------------------------------------------------------------- #
+def _fake_torchaudio(bundle_names, bundle=None):
+    import types
+
+    pipe = types.ModuleType("torchaudio.pipelines")
+    pipe.__all__ = list(bundle_names)
+    for name in bundle_names:
+        setattr(pipe, name, bundle)
+    ta = types.ModuleType("torchaudio")
+    ta.pipelines = pipe
+    return ta
+
+
+def test_get_ctc_aligner_bundle_structure(monkeypatch):
+    import sys
+
+    class _M:
+        def to(self, d):
+            return self
+
+        def eval(self):
+            return self
+
+    class _Bundle:
+        sample_rate = 16000
+
+        @staticmethod
+        def get_model():
+            return _M()
+
+        @staticmethod
+        def get_labels():
+            return ("-", "|", "A", "B", "'")  # 0=blank '-', 1=sep '|'
+
+    monkeypatch.setitem(sys.modules, "torchaudio", _fake_torchaudio(["FAKE"], _Bundle))
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    backend._ctc = None
+    backend._ctc_lang = None
+    try:
+        al = backend._get_ctc_aligner("en", "FAKE")
+        assert al.kind == "torchaudio" and al.blank == 0 and al.sep_id == 1
+        assert al.proc is None and al.sr == 16000
+        assert (
+            al.invocab["A"] == 2 and al.invocab["'"] == 4
+        )  # blank(0)/sep(1) excluded from invocab
+        assert "-" not in al.invocab and "|" not in al.invocab
+    finally:
+        backend._ctc = None
+        backend._ctc_lang = None
+
+
+def test_get_ctc_aligner_hf_structure(monkeypatch):
+    import sys
+    import types
+
+    class _Tok:
+        pad_token_id = 0
+
+        def get_vocab(self):
+            return {"<pad>": 0, "</s>": 2, "|": 4, "私": 5, "の": 6}
+
+    class _FE:
+        sampling_rate = 16000
+
+    seen_cache = []
+
+    class _Proc:
+        tokenizer = _Tok()
+        feature_extractor = _FE()
+
+        @classmethod
+        def from_pretrained(cls, name, local_files_only=True, cache_dir=None):
+            seen_cache.append(cache_dir)
+            return cls()
+
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, name, local_files_only=True, cache_dir=None):
+            seen_cache.append(cache_dir)
+            return cls()
+
+        def to(self, d):
+            return self
+
+        def eval(self):
+            return self
+
+    tf = types.ModuleType("transformers")
+    tf.Wav2Vec2ForCTC = _Model
+    tf.Wav2Vec2Processor = _Proc
+    # model_name not in bundle __all__ -> takes HF branch
+    monkeypatch.setitem(sys.modules, "torchaudio", _fake_torchaudio([]))
+    monkeypatch.setitem(sys.modules, "transformers", tf)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    backend._ctc = None
+    backend._ctc_lang = None
+    try:
+        al = backend._get_ctc_aligner("ja", "jonatasgrosman/xlsr-ja")
+        assert al.kind == "hf" and al.blank == 0 and al.sep_id == 4
+        assert al.proc is not None and al.sr == 16000
+        assert (
+            al.invocab["私"] == 5 and al.invocab["の"] == 6
+        )  # HF path invocab = full vocab
+        # processor + model both download into the voxweave align cache subdir
+        assert seen_cache == [backend.config.ALIGN_CACHE, backend.config.ALIGN_CACHE]
+    finally:
+        backend._ctc = None
+        backend._ctc_lang = None

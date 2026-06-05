@@ -1,0 +1,446 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import click
+
+from voxweave import config, pipeline
+from voxweave.ui import (
+    RichReporter,
+    correct_summary_panel,
+    error_panel,
+    install_logging,
+    summary_panel,
+    translate_summary_panel,
+)
+
+
+class DefaultGroup(click.Group):
+    """`voxweave <media>` runs transcription without an explicit subcommand.
+
+    ``default_cmd`` is not in ``self.commands`` (invisible in help, not callable as
+    `voxweave transcribe`). When the first token is not a known subcommand or group
+    option, the private token is injected at the front of ``args`` during
+    ``parse_args`` — this handles ``voxweave --debug a.mkv`` where options precede
+    the media arg (injecting at resolve_command time would choke on ``--debug`` first).
+    """
+
+    default_cmd: click.Command | None = None
+    _GROUP_OPTS = frozenset({"-h", "--help", "-v", "--verbose", "--version"})
+    # Not typeable by users; resolve_command returns cmd.name so usage strings still show "transcribe".
+    _TOKEN = "\x00voxweave-default"
+
+    def get_command(self, ctx, cmd_name):
+        if self.default_cmd is not None and cmd_name == self._TOKEN:
+            return self.default_cmd
+        return super().get_command(ctx, cmd_name)
+
+    def _needs_default(self, token: str) -> bool:
+        return (
+            self.default_cmd is not None
+            and token != self._TOKEN
+            and token not in self.commands
+            and token not in self._GROUP_OPTS
+        )
+
+    def parse_args(self, ctx, args):
+        if args and self._needs_default(args[0]):
+            args = [self._TOKEN, *args]
+        return super().parse_args(ctx, args)
+
+    def resolve_command(self, ctx, args):
+        # After group-level options are consumed a bare media arg may remain — inject default.
+        if args and not args[0].startswith("-") and self._needs_default(args[0]):
+            args = [self._TOKEN, *args]
+        cmd_name, cmd, rest = super().resolve_command(ctx, args)
+        if cmd is not None and cmd is self.default_cmd:
+            cmd_name = (
+                cmd.name
+            )  # show "transcribe" in usage strings, not the private token
+        return cmd_name, cmd, rest
+
+
+@click.group(
+    cls=DefaultGroup,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+@click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG-level logging.")
+@click.version_option(package_name="voxweave", message="voxweave %(version)s")
+def cli(verbose: bool) -> None:
+    """Qwen3 subtitle pipeline orchestrator.
+
+    Run `voxweave <media>` directly to transcribe (no `transcribe` subcommand needed).
+    `--debug` implies local mode.
+    """
+    install_logging(verbose=verbose)
+    config.ensure_default_config()  # write default config template on first run
+
+
+@click.command("transcribe")
+@click.argument("media", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--language",
+    default=None,
+    help="Force language (ISO code or full name); default: auto-detect.",
+)
+@click.option(
+    "--model",
+    default=None,
+    envvar="VOXWEAVE_ASR_MODEL",
+    help=(
+        "Local ASR model (default: Qwen3-ASR-0.6B; use qwen3-asr-1.7B or full HF id for higher accuracy; "
+        "or faster-whisper: large-v3 / large-v3-turbo / turbo)."
+    ),
+)
+@click.option(
+    "--separate/--no-separate",
+    default=True,
+    help="Separate vocals to remove BGM (default: on; use --no-separate for clean speech to skip GPU separation).",
+)
+@click.option(
+    "--debug",
+    is_flag=True,
+    default=False,
+    help="Save intermediate artifacts (fullband/vocals/chunk wavs + ASR raw/alignment) to debug/<stem>/ for"
+    " inspection (implies local mode: artifacts are only written during local orchestration).",
+)
+@click.option(
+    "--normalize",
+    is_flag=True,
+    default=False,
+    help="Apply loudnorm to the 16k ASR input; useful for uneven volume or quiet post-separation audio (may boost noise).",
+)
+@click.option(
+    "--skip-songs/--no-skip-songs",
+    default=True,
+    help="Use PANNs to detect and skip music segments on separated vocals before ASR (default: on;"
+    " prevents OP/ED/insert song hallucinations). Use --no-skip-songs to transcribe song lyrics or pure music.",
+)
+@click.option(
+    "--context",
+    default=None,
+    envvar="VOXWEAVE_ASR_CONTEXT",
+    help="ASR bias prompt (free text: names/terms/proper nouns, comma or newline separated);"
+    " biases transcription toward these tokens, reducing errors on names and loanwords. Reused for all chunks.",
+)
+@click.option(
+    "--hybrid",
+    is_flag=True,
+    default=False,
+    help="Dual-ASR fusion: whisper for accurate text + Qwen-1.7B for punctuation positions (merged timeline)."
+    " Better text than pure Qwen for ja/en; better segmentation than pure whisper (which emits no punctuation)."
+    " Runs two ASR passes per chunk (separation only once). Overrides --model."
+    " Sub-models: env VOXWEAVE_FUSION_WHISPER / VOXWEAVE_FUSION_QWEN or conf [fusion] whisper/qwen.",
+)
+@click.option(
+    "--timestamps/--no-timestamps",
+    default=True,
+    help="Include word-level timestamps in VTT (default: on, same precision as align output, ready to use)."
+    " Use --no-timestamps for a plain-text editing draft; run align afterwards to re-assign timing.",
+)
+def cmd_transcribe(
+    media: Path,
+    language: str | None,
+    model: str | None,
+    separate: bool,
+    debug: bool,
+    normalize: bool,
+    skip_songs: bool,
+    context: str | None,
+    hybrid: bool,
+    timestamps: bool,
+) -> None:
+    """Media -> (vocal separation) -> VAD -> local ASR/alignment -> smart_split -> write VTT+JSON."""
+    try:
+        with RichReporter() as rep:
+            out = pipeline.process(
+                media,
+                lang_override=language,
+                separate=separate,
+                reporter=rep,
+                debug=debug,
+                normalize=normalize,
+                skip_songs=skip_songs,
+                asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
+                context=context,
+                timestamps=timestamps,
+            )
+    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
+        error_panel(exc)
+        sys.exit(1)
+    dbg_dir = Path("debug") / media.stem if debug else None
+    summary_panel(
+        out,
+        separated=separate,
+        debug_dir=dbg_dir,
+        normalized=normalize,
+    )
+    click.echo(out)  # path -> stdout for script/pipe consumption
+
+
+cli.default_cmd = (
+    cmd_transcribe  # bare `voxweave <media>` routes here; not listed in help
+)
+
+
+@cli.command("split")
+@click.argument(
+    "json_path",
+    metavar="JSON",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--max-line-length", type=int, default=None, help="Maximum characters per line."
+)
+@click.option("--max-lines", type=int, default=None, help="Maximum lines per cue.")
+@click.option(
+    "--timestamps/--no-timestamps",
+    default=True,
+    help="Include timestamps in VTT (default: on; use --no-timestamps for a plain-text editing draft).",
+)
+def cmd_split(
+    json_path: Path,
+    max_line_length: int | None,
+    max_lines: int | None,
+    timestamps: bool,
+) -> None:
+    """Offline re-layout: re-run smart_split from <stem>.json without running any models."""
+    kwargs: dict = {}
+    if max_line_length is not None:
+        kwargs["max_line_length"] = max_line_length
+    if max_lines is not None:
+        kwargs["max_lines"] = max_lines
+    try:
+        out = pipeline.split(json_path, timestamps=timestamps, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - top-level catch-all
+        error_panel(exc)
+        sys.exit(1)
+    click.echo(out)
+
+
+@cli.command("align")
+@click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--media",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Source media path (default: look for same-name file in same directory); required for forced alignment.",
+)
+@click.option(
+    "--language",
+    default=None,
+    help="Force language (ISO code or full name); default: read from JSON.",
+)
+@click.option(
+    "--separate/--no-separate",
+    default=True,
+    help="Use separated vocals at 16k for alignment (default: on, prevents BGM interference;"
+    " cache hit skips separation; use --no-separate for clean audio sources).",
+)
+@click.option(
+    "--normalize",
+    is_flag=True,
+    default=False,
+    help="Apply loudnorm to the 16k alignment input.",
+)
+def cmd_align(
+    vtt: Path,
+    media: Path | None,
+    language: str | None,
+    separate: bool,
+    normalize: bool,
+) -> None:
+    """Re-align after editing: run forced alignment on edited VTT text against the original audio,
+    overwrite VTT with timestamps, and update JSON.
+
+    **Loads alignment/separation models locally** (in-process PyTorch, see voxweave.backend); no endpoint calls.
+    """
+    try:
+        with RichReporter() as rep:
+            out = pipeline.align(
+                vtt,
+                media_path=media,
+                separate=separate,
+                normalize=normalize,
+                lang_override=language,
+                reporter=rep,
+            )
+    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
+        error_panel(exc)
+        sys.exit(1)
+    summary_panel(out, separated=separate, normalized=normalize)
+    click.echo(out)
+
+
+@cli.command("translate")
+@click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--to",
+    default="zh",
+    help="Target language code (written to <stem>.<to>.vtt); default: zh.",
+)
+@click.option(
+    "--context", default=None, help="Show/tone context injected into the prompt."
+)
+@click.option(
+    "--glossary",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Term/name glossary (.json -> mapping dict; any other format -> passed as raw text prompt).",
+)
+@click.option(
+    "--model",
+    default=None,
+    envvar="VOXWEAVE_TRANSLATE_MODEL",
+    help="Translation model (default: VOXWEAVE_TRANSLATE_MODEL env or gpt-5.3-chat-latest).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    envvar="OPENAI_BASE_URL",
+    help="OpenAI-compatible endpoint URL.",
+)
+@click.option(
+    "--api-key-env",
+    default="OPENAI_API_KEY",
+    help="Environment variable to read the API key from (default: OPENAI_API_KEY).",
+)
+def cmd_translate(
+    vtt: Path,
+    to: str,
+    context: str | None,
+    glossary: Path | None,
+    model: str | None,
+    base_url: str | None,
+    api_key_env: str,
+) -> None:
+    """Translate after align: call OpenAI to translate each cue in an aligned VTT, write <stem>.<to>.vtt (original unchanged)."""
+    from voxweave.translate import load_glossary
+
+    gloss = load_glossary(glossary) if glossary else None
+    api_key = os.environ.get(api_key_env)
+    if not api_key:
+        error_panel(
+            RuntimeError(
+                f"API key not found: set env {api_key_env} (or use --api-key-env to specify another variable)"
+            )
+        )
+        sys.exit(1)
+    kwargs: dict = {}
+    if model:
+        kwargs["model"] = model
+    if base_url:
+        kwargs["base_url"] = base_url
+    try:
+        with RichReporter() as rep:
+            out = pipeline.translate(
+                vtt,
+                to=to,
+                context=context,
+                glossary=gloss,
+                api_key=api_key,
+                reporter=rep,
+                **kwargs,
+            )
+    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
+        error_panel(exc)
+        sys.exit(1)
+    translate_summary_panel(out, to=to)
+    click.echo(out)
+
+
+@cli.command("correct")
+@click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--glossary",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Term/name glossary (.json -> mapping dict; any other format -> raw text prompt); strongly recommended for ambiguous proper nouns.",
+)
+@click.option(
+    "--apply",
+    is_flag=True,
+    default=False,
+    help="Overwrite the original VTT in place (no sidecar json) and auto re-align; default: write sidecar <stem>.asrfix.vtt for review.",
+)
+@click.option(
+    "--align/--no-align",
+    "do_align",
+    default=True,
+    help="With --apply, automatically re-run alignment afterwards to refresh timestamps (default: on).",
+)
+@click.option(
+    "--media",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Source media for the auto re-align (default: sibling file with the same stem).",
+)
+@click.option(
+    "--model",
+    default=None,
+    envvar="VOXWEAVE_FIX_MODEL",
+    help="Correction model (default: VOXWEAVE_FIX_MODEL env or gpt-5.3-chat-latest).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    envvar="OPENAI_BASE_URL",
+    help="OpenAI-compatible endpoint URL.",
+)
+@click.option(
+    "--api-key-env",
+    default="OPENAI_API_KEY",
+    help="Environment variable to read the API key from (default: OPENAI_API_KEY).",
+)
+def cmd_correct(
+    vtt: Path,
+    glossary: Path | None,
+    apply: bool,
+    do_align: bool,
+    media: Path | None,
+    model: str | None,
+    base_url: str | None,
+    api_key_env: str,
+) -> None:
+    """Pre-align LLM correction: fix obvious ASR errors, split words, and garbled proper nouns; produce a reviewable diff.
+
+    By default writes only sidecar ``<stem>.asrfix.vtt`` + audit ``<stem>.asrfix.json`` (original
+    VTT untouched). ``--apply`` overwrites the original VTT in place (no audit json) and, since the
+    text changed, automatically re-runs alignment to refresh timestamps (use ``--no-align`` to skip).
+    Safety gate: only applies revisions where orig matches the original text line-for-line.
+    """
+    from voxweave.translate import load_glossary
+
+    gloss = load_glossary(glossary) if glossary else None
+    api_key = os.environ.get(api_key_env)
+    if not api_key:
+        error_panel(
+            RuntimeError(
+                f"API key not found: set env {api_key_env} (or use --api-key-env to specify another variable)"
+            )
+        )
+        sys.exit(1)
+    kwargs: dict = {}
+    if model:
+        kwargs["model"] = model
+    if base_url:
+        kwargs["base_url"] = base_url
+    try:
+        with RichReporter() as rep:
+            res = pipeline.correct(
+                vtt,
+                glossary=gloss,
+                api_key=api_key,
+                apply=apply,
+                align_after=apply and do_align,
+                media_path=media,
+                reporter=rep,
+                **kwargs,
+            )
+    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
+        error_panel(exc)
+        sys.exit(1)
+    correct_summary_panel(res)
+    click.echo(res["out"])

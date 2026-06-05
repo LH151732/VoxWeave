@@ -1,0 +1,109 @@
+[project]
+name = "voxweave"
+version = "0.1.0"
+description = "BGM-robust subtitles for anime / film / clips: vocal separation + song-skip so ASR doesn't hallucinate on background music, OP/ED, or insert songs. Local-first Qwen3 ASR + forced alignment + edit-and-resync, CJK-aware."
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [{ name = "Hao Li" }]
+keywords = ["subtitles", "asr", "forced-alignment", "whisper", "qwen", "vtt"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Text Processing :: Linguistic",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = [
+    # Core runtime: VAD + audio I/O + CLI.
+    "silero-vad>=5",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    "click>=8.1",
+    "rich>=13",
+    # --- Local Qwen3 pipeline (default engine; in-process PyTorch on GPU; see voxweave.backend) ---
+    # qwen-asr hard-pins transformers==4.57.6 + accelerate==1.12.0 and pulls librosa + torch.
+    # The torch wheel is pinned to cu128 via the Makefile (uv tool install --torch-backend=cu128).
+    # Mel-Band Roformer is vendored into voxweave.vendor (PyPI bs-roformer has architecture drift),
+    # so only its runtime deps are listed: einops + rotary-embedding-torch + beartype.
+    "qwen-asr>=0.0.4",
+    "einops>=0.8",
+    "rotary-embedding-torch>=0.6",
+    "beartype>=0.18",
+    "librosa>=0.10",
+    "pyyaml>=6",
+    # wav2vec2 CTC forced alignment for English (WhisperX-equivalent; backend.align_text_ctc).
+    # Tracks torch ABI; lower bound only.
+    "torchaudio>=2.1",
+    # MMS-300m + uroman forced alignment (default aligner for ja/CJK; zero OOV; align_text_mms).
+    # onnxruntime-gpu = CUDA inference (the CPU onnxruntime is overridden in [tool.uv], see below);
+    # unidecode is an undeclared implicit dep of ctc-forced-aligner.preprocess_text.
+    # Model auto-downloads to ~/.cache/ctc-forced-aligner on first run.
+    "ctc-forced-aligner>=1.0.2",
+    "onnxruntime-gpu>=1.20",
+    "unidecode>=1.3",
+    # Subtitle layout/re-wrap: smart_split logic lives in voxweave.core; PySBD is its runtime dep.
+    "pysbd>=0.3.4",
+    # PANNs song-skip detection (--skip-songs).
+    "panns-inference>=0.1.0",
+    # CJK line-break: BudouX phrase atoms as non-breakable units (ja/zh) + jieba word segmentation
+    # to snap Qwen's off-boundary punctuation back to word edges. Both lazy-imported
+    # (voxweave.realign.snap_break_punct); fall back to character-level if import fails.
+    "budoux>=0.8",
+    "jieba>=0.42",
+    # OpenAI subtitle translation (translate sub-command; lazy import).
+    "openai>=1.40",
+]
+
+[project.scripts]
+voxweave = "voxweave.__main__:cli"
+
+[project.optional-dependencies]
+# The local Qwen3 pipeline — vocal separation / ASR / forced alignment (incl. MMS-300m for
+# ja·CJK) / smart_split layout / PANNs song-skip — plus CJK line-break and translation are now
+# part of the core dependencies above, so a bare `uv tool install voxweave` is ready to use.
+# This `qwen` extra is kept as a no-op alias so existing `voxweave[qwen]` invocations and docs
+# keep resolving (the finer-grained smart_split/songdet/mms/cjk_break/translate extras were
+# folded into core and removed).
+qwen = []
+# ASR engine B — faster-whisper for transcription (hybrid mode; --model large-v3 / large-v3-turbo).
+# The forced aligner it pairs with (Qwen3ForcedAligner) is already in the core deps, so this
+# extra only adds faster-whisper itself (pulls ctranslate2 + av (PyAV) + a CPU onnxruntime for
+# its built-in VAD, which is disabled at runtime via vad_filter=False).
+whisper = ["faster-whisper>=1.1"]
+# Full bundle = core (Qwen pipeline + CJK break + translate) + the faster-whisper engine.
+all = ["voxweave[whisper]"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+# Both ctc-forced-aligner and faster-whisper hard-depend on the CPU `onnxruntime` package.
+# It shares the same installed name as `onnxruntime-gpu` (both install the `onnxruntime`
+# import package), so the CPU build would shadow the GPU one, causing
+# CUDAExecutionProvider to disappear (MMS alignment degrades to CPU — unusably slow on
+# a 24-minute episode). We override the CPU onnxruntime with a permanently-false marker
+# so only onnxruntime-gpu is installed. `import onnxruntime` is still satisfied by the
+# GPU build with the CUDA provider intact; faster-whisper's built-in VAD is disabled
+# (vad_filter=False) so losing that onnxruntime provider has no effect.
+override-dependencies = ["onnxruntime; sys_platform == 'voxweave_drop_cpu_ort'"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["voxweave*"]
+
+[tool.setuptools.package-data]
+# Separator config bundled with the package (must match the frozen MelBandRoformer
+# architecture vendored in voxweave.vendor).
+"voxweave.vendor" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+# voxweave/vendor contains frozen third-party model code (lucidrains/audio-separator) -- skip lint/format
+extend-exclude = ["voxweave/vendor"]

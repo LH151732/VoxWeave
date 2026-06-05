@@ -1,0 +1,406 @@
+<div align="center">
+
+<img src="resources/VoxWeave_icon.png" alt="VoxWeave" width="200"/>
+
+# VoxWeave
+
+**BGM-robust subtitles for anime, film, and clips.**
+
+Vocal separation and song-skip so ASR never hallucinates on background music, OP/ED, or
+insert songs. Local-first Qwen3 ASR, forced alignment, and edit-and-resync — CJK-aware.
+
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)
+![CUDA cu128](https://img.shields.io/badge/CUDA-cu128-76B900?logo=nvidia&logoColor=white)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/hali0515)
+
+https://github.com/user-attachments/assets/e75b6dd3-fa37-4afe-89db-b6ee2c28f6bc
+
+<sub>Sliced clip under heavy BGM · <code>voxweave Test.mp4</code> · Qwen3-ASR-1.7B</sub>
+
+</div>
+
+> [!NOTE]
+> **100% local.** Separation, ASR, and forced alignment all run in-process with PyTorch on
+> your GPU — no network endpoints, no audio leaves the machine. Weights download once on
+> first run. (Translation and ASR-correction are the only optional features that call an
+> external LLM, and only when you invoke them.)
+
+VoxWeave derives from the WhisperX "edit-and-resync" workflow: transcribe once, then edit
+the text and re-align it against the original audio for frame-accurate timestamps. Where it
+differs is the front end — vocal separation and song-skip keep background music out of the
+ASR, and a CJK-aware layout/alignment stack (MMS-300m for Japanese, BudouX/jieba for line
+breaks) handles Chinese/Japanese/English as first-class.
+
+## Contents
+
+- [Why VoxWeave](#why-voxweave)
+- [Setup](#setup)
+- [Quickstart](#quickstart)
+- [Usage](#usage)
+  - [Transcribe (`voxweave <media>`)](#transcribe)
+  - [Re-align after editing (`align`)](#re-align-after-editing)
+  - [Re-layout offline (`split`)](#re-layout-offline)
+  - [ASR correction (`correct`)](#asr-correction)
+  - [Translate (`translate`)](#translate)
+- [The edit-and-resync workflow](#the-edit-and-resync-workflow)
+- [How it works](#how-it-works)
+- [Configuration](#configuration)
+- [Data contract](#data-contract)
+- [Testing](#testing)
+- [Support](#support)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
+
+## Why VoxWeave
+
+- **BGM removal before ASR.** A Mel-Band Roformer vocal separator (pure torch, full-band
+  44.1k) strips music first, so ASR doesn't transcribe lyrics or hallucinate on score.
+- **Song-skip.** PANNs detects singing/music on the separated vocals and skips OP/ED and
+  insert songs before ASR — on by default, `--no-skip-songs` to keep them.
+- **Local Qwen3 ASR + forced alignment.** Text and word-level timestamps in one pass, fully
+  on-device. A faster-whisper hybrid engine is available for when you prefer Whisper text.
+- **Edit-and-resync.** Fix the transcript by hand, then `align` re-derives timestamps from
+  the audio — timestamps are _never_ hand-written.
+- **CJK-aware.** Japanese aligns with MMS-300m + uroman (zero-OOV, immune to the per-cue
+  drift that breaks wav2vec2-xlsr on rare kanji); line breaks use BudouX phrase atoms + jieba.
+- **Optional LLM steps.** `correct` cleans up ASR typos/garbled names before alignment;
+  `translate` does whole-episode context-aware translation while preserving cue count.
+
+## Setup
+
+Requires an **NVIDIA GPU** (Blackwell sm_120 / cu128 by default) and `ffmpeg` on PATH.
+
+<details>
+<summary><b>Install ffmpeg</b></summary>
+
+```bash
+# Ubuntu / Debian
+sudo apt update && sudo apt install ffmpeg
+# Arch Linux
+sudo pacman -S ffmpeg
+# macOS (Homebrew)
+brew install ffmpeg
+```
+
+</details>
+
+<details>
+<summary><b>CUDA / PyTorch notes</b></summary>
+
+The torch wheel is pinned to the **cu128** build (Blackwell sm_120) and installed into an
+isolated `uv` tool venv. The CUDA toolkit does **not** need to be installed separately — the
+cu128 wheel bundles the required runtime libraries; only an NVIDIA driver is required on the
+host. To build for a different target, override per-invocation: `make install TORCH_BACKEND=cpu`.
+
+</details>
+
+**End-user install** (puts the global `voxweave` command on PATH):
+
+```bash
+make install        # = uv tool install --torch-backend=cu128 ".[all]"
+make reinstall      # after pulling new code
+make uninstall
+```
+
+The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
+Japanese/CJK), layout, song-skip — plus CJK line-break and translation are baked into the
+**core dependencies**, so a bare `uv tool install voxweave` already works out of the box.
+`[all]` additionally pulls the faster-whisper hybrid engine.
+
+<details>
+<summary><b>Extras & what each pulls</b></summary>
+
+- The core pulls `qwen-asr` (hard-pins `transformers==4.57.6` + `accelerate==1.12.0`) + a
+  pure-torch Mel-Band Roformer vendored in `voxweave.vendor` (**no onnx/onnxruntime** —
+  `audio-separator` is intentionally avoided because it eagerly imports onnxruntime at the
+  top level) + MMS-300m forced aligner (`ctc-forced-aligner` + `onnxruntime-gpu`) + layout
+  (`pysbd`) + song-skip (`panns-inference`) + CJK break (`budoux` + `jieba`) + translation (`openai`).
+- The only extras left are **`[whisper]`** (adds faster-whisper) and **`[all]`** (= core +
+  `[whisper]`). `[qwen]` remains as a no-op back-compat alias.
+- Slim install without the whisper engine: `make install EXTRAS=qwen`.
+- **Development**: `make dev` (= `uv sync --all-extras --dev`).
+
+</details>
+
+## Quickstart
+
+```bash
+# Transcribe a video to a timestamped VTT (+ a JSON source of truth)
+voxweave episode.mkv
+
+# ...edit episode.vtt by hand (fix wording, line breaks)...
+
+# Re-align the edited text against the original audio
+voxweave align episode.vtt
+
+# Optionally translate the aligned subtitles to Chinese
+voxweave translate episode.vtt --to zh
+```
+
+## Usage
+
+### Transcribe
+
+`voxweave <media>` — separation → song-skip → VAD chunking → ASR + forced alignment →
+smart_split → writes `<stem>.vtt` (editable) + `<stem>.json` (word-level timestamp source of
+truth). Models load in-process (see `voxweave.backend`); the separator is released from VRAM
+before ASR+alignment load, so peak usage is ≈ max(sep, asr) rather than their sum.
+
+```bash
+voxweave episode.mkv
+voxweave clip.mp4 --no-separate          # clean speech (podcast/lecture): skip separation
+voxweave episode.mkv --model qwen3-asr-1.7B   # larger, more accurate ASR
+```
+
+<details>
+<summary><b>Options</b></summary>
+
+| Option                         | Description                                                                                             |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `--language`                   | Force language (ISO code or full name); default auto-detect.                                            |
+| `--no-separate`                | Skip vocal separation (for clean speech) to save GPU time.                                              |
+| `--no-skip-songs`              | Keep lyrics / transcribe purely musical content (song-skip is on by default).                           |
+| `--model`                      | Local ASR model (default `Qwen3-ASR-0.6B`; `qwen3-asr-1.7B` is more accurate).                          |
+| `--normalize`                  | Apply loudness normalization (`loudnorm`) to the 16k ASR input.                                         |
+| `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.    |
+| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`. |
+
+</details>
+
+### Re-align after editing
+
+`voxweave align <vtt>` — takes the edited VTT text and **re-runs forced alignment against the
+original audio**, overwriting the timestamped VTT and updating the JSON. Does not re-run ASR
+or touch smart_split. Aligns on separated 16k vocals by default (prevents BGM interference);
+prefers a cached `cache/<stem>.16k.flac`, otherwise re-separates and caches.
+
+```bash
+voxweave align episode.vtt                 # finds episode.<ext> in the same dir
+voxweave align episode.vtt --media original.mkv
+voxweave align episode.vtt --no-separate   # align on the original audio (clean sources)
+```
+
+<details>
+<summary><b>Options</b></summary>
+
+| Option          | Description                                                        |
+| --------------- | ------------------------------------------------------------------ |
+| `--media`       | Source media path (default: same-name file in the same directory). |
+| `--language`    | Force language (ISO code or full name); default: read from JSON.   |
+| `--no-separate` | Align on the original audio instead of separated vocals.           |
+| `--normalize`   | Apply `loudnorm` to the 16k alignment input.                       |
+
+</details>
+
+### Re-layout offline
+
+`voxweave split <json>` — re-run smart_split from `<stem>.json` **without any models** (adjust
+line width / sentence breaks instantly).
+
+```bash
+voxweave split episode.json --max-line-length 14 --max-lines 1
+voxweave split episode.json --no-timestamps   # plain-text editing draft
+```
+
+### ASR correction
+
+`voxweave correct <vtt>` — optional **pre-align** LLM pass that fixes obvious ASR typos, split
+words, and garbled proper nouns, producing a reviewable diff. Conservative substitution only
+(no completion/rewrite), gated by a code check that the matched text equals the original
+line-for-line. By default writes only a sidecar `<stem>.asrfix.vtt` + audit JSON — the
+original VTT is untouched. Use `--apply` to overwrite, **then run `align`** to reassign timing.
+
+```bash
+voxweave correct episode.vtt --glossary names.json   # review the sidecar
+voxweave correct episode.vtt --glossary names.json --apply
+voxweave align episode.vtt
+```
+
+<details>
+<summary><b>Options</b></summary>
+
+| Option                         | Description                                                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt). Strongly recommended for ambiguous proper nouns. |
+| `--apply`                      | Overwrite the original VTT (default: sidecar only, for review).                                              |
+| `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env or `gpt-5.3-chat-latest`).                                |
+| `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key.                                                    |
+
+</details>
+
+### Translate
+
+`voxweave translate <vtt>` — **after align**, translate each cue with whole-episode context,
+preserving cue count, into `<stem>.<to>.vtt` (the original is left unchanged).
+
+```bash
+voxweave translate episode.vtt --to zh
+voxweave translate episode.vtt --to en --context "sci-fi, formal register" --glossary terms.json
+```
+
+<details>
+<summary><b>Options</b></summary>
+
+| Option                         | Description                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------ |
+| `--to`                         | Target language code, written to `<stem>.<to>.vtt` (default `zh`).                   |
+| `--context`                    | Show/tone context injected into the prompt.                                          |
+| `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt).                          |
+| `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env or `gpt-5.3-chat-latest`). |
+| `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key.                            |
+
+</details>
+
+Progress is rendered with rich: countable stages (demix windows / PANNs batches / per-chunk
+ASR+alignment / align per-cue / translate streaming per-line) show a real `x/N` bar with
+elapsed time; indeterminate stages (decode / file write) show a pulse bar. `-v/--verbose`
+enables DEBUG logging.
+
+## The edit-and-resync workflow
+
+```
+voxweave episode.mkv          # 1. transcribe  -> episode.vtt + episode.json
+  └─ (optional) correct       # 2. LLM ASR fix -> episode.asrfix.vtt (--apply to commit)
+edit episode.vtt by hand      # 3. fix wording / line breaks
+voxweave align episode.vtt    # 4. re-derive timestamps from audio (overwrites VTT + JSON)
+voxweave translate episode.vtt --to zh   # 5. context-aware translation
+```
+
+Timestamps are **always** derived from the audio by the forced aligner — you never hand-edit
+them. Edit the text freely; `align` puts the timing back.
+
+## How it works
+
+| Stage           | What runs                                                                                                                  |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **Separation**  | Mel-Band Roformer (full-band 44.1k stereo, vendored pure-torch) isolates vocals; downsampled to 16k afterwards.            |
+| **Song-skip**   | PANNs (route ii) flags singing/music on the separated vocals before ASR.                                                   |
+| **Chunking**    | Silero VAD splits speech into ≤120s chunks (longer risks ASR repetition-loop collapse).                                    |
+| **ASR + align** | Qwen3-ASR (default, text + units in one pass) / faster-whisper hybrid / dual-ASR fusion — the pipeline is engine-agnostic. |
+| **Alignment**   | `ja` → MMS-300m + uroman (full-file single pass, WhisperX-gold); `en` → wav2vec2-LV60K CTC per-cue; `zh`·`yue` → Qwen.     |
+| **Layout**      | gap-aware `smart_split`: word-level gaps + BudouX phrase atoms + line-length, on a shared timeline forked per language.    |
+
+## Configuration
+
+Precedence: **CLI flag > env var > `~/.config/voxweave.conf` > built-in default.** A commented
+default config is written on first run (migrated automatically from a pre-rename `qsub.conf`).
+
+<details>
+<summary><b>Environment variables</b></summary>
+
+**Models**
+
+- `VOXWEAVE_ASR_MODEL` (default `Qwen/Qwen3-ASR-0.6B`; same as `--model`)
+- `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
+- `VOXWEAVE_DEVICE` (default `cuda:0`)
+
+All model weights are cached under `~/.cache/huggingface/hub` (auto-downloaded on first use), so a
+container only needs to bind-mount that one directory. Each model exposes an env override to swap
+the HF repo, or to point at an explicit local file (which, if it exists, skips the HF download):
+
+- `VOXWEAVE_SEPARATOR_REPO` / `VOXWEAVE_SEPARATOR_REPO_FILE` (default `KimberleyJSN/melbandroformer` /
+  `MelBandRoformer.ckpt`), or `VOXWEAVE_SEPARATOR_CKPT` / `VOXWEAVE_SEPARATOR_CONFIG` for explicit
+  weights + matching yaml
+- `VOXWEAVE_PANNS_REPO` / `VOXWEAVE_PANNS_REPO_FILE` (default `thelou1s/panns-inference` /
+  `Cnn14_mAP=0.431.pth`), or `VOXWEAVE_PANNS_CKPT` for an explicit checkpoint (song-skip CNN)
+- `VOXWEAVE_MMS_REPO` / `VOXWEAVE_MMS_REPO_FILE` (default `deskpai/ctc_forced_aligner` /
+  `04ac86b67129634da93aea76e0147ef3.onnx`), or `VOXWEAVE_MMS_MODEL` for an explicit onnx path
+  (Japanese/CJK MMS-300m aligner)
+
+**Tuning**
+
+- `VOXWEAVE_MAX_CHUNK_SEC` (default 120; shorter chunks reduce ASR repetition loops on long segments)
+- `VOXWEAVE_LOUDNORM` (default `loudnorm=I=-16:TP=-1.5:LRA=11`; the `-af` filter for `--normalize`)
+- `VOXWEAVE_MIN_CUE_SEC` (default 0.8; minimum cue display duration in `align`)
+- `VOXWEAVE_SNAP_VAD_THRESHOLD` (default 0.25; sensitive VAD used when repositioning
+  zero-duration units against the original audio)
+
+</details>
+
+<details>
+<summary><b>Config file (<code>~/.config/voxweave.conf</code>, TOML)</b></summary>
+
+Every key below is optional — delete a line to fall back to its built-in default. The values
+shown are a usable starting point, not the defaults (the auto-written template has everything
+commented out).
+
+```toml
+# ~/.config/voxweave.conf  —  TOML
+# Precedence: CLI flag > env var > this file > built-in default.
+
+# Default ASR model (= --model). Short name (qwen3-asr-0.6b | qwen3-asr-1.7b) or full HF id.
+# Special value "hybrid" (= --hybrid) -> dual-ASR fusion (whisper text + Qwen punctuation).
+asr_model = "Qwen/Qwen3-ASR-1.7B"        # built-in default: Qwen/Qwen3-ASR-0.6B
+
+# Model load strategy:
+#   "peak" (default) — serial peak-shaving: all-chunk ASR -> release -> all-chunk align;
+#                      ASR and aligner never co-reside, peak VRAM = max(models). Works on 8 GB.
+#   "sum"            — concurrent per-chunk ASR+align; peak VRAM = sum(models), but skips two
+#                      model swap round-trips (faster on large-VRAM cards).
+load_strategy = "sum"
+
+# dual-ASR fusion sub-models — only consulted when running with --hybrid.
+[fusion]
+whisper = "large-v3-turbo"               # faster-whisper size: large-v3 (best) | large-v3-turbo (~5x faster)
+qwen    = "Qwen/Qwen3-ASR-1.7B"          # punctuation model; must emit punctuation -> 1.7B, not 0.6B
+
+# Per-language forced-alignment model. Key = ISO-639-1 code; unlisted languages use Qwen3-ForcedAligner.
+# Values:
+#   "mms"   — MMS-300m + uroman, full-file single pass (immune to per-cue drift; the gold standard).
+#   HF id   — wav2vec2 CTC via HF transformers; weights land in ~/.cache/huggingface/hub (per-cue crop).
+#   bundle  — torchaudio bundle name, e.g. "WAV2VEC2_ASR_LARGE_LV60K_960H" (same model, cached in ~/.cache/torch).
+#   ""      — explicitly fall back to Qwen for that language.
+[align]
+en = "facebook/wav2vec2-large-960h-lv60-self"  # English: LV60K-self CTC, per-cue crop (HF hub)
+ja = "mms"                                      # Japanese: MMS-300m + uroman full-file (= whisperx fork align_ctc)
+# zh  = "mms"                                   # Chinese can also use MMS; default is Qwen (native CJK char-level)
+# yue = ""                                      # force Qwen for Cantonese
+```
+
+</details>
+
+## Data contract
+
+Each input produces two sibling files:
+
+- **`<stem>.json`** — the source of truth: word/character-level segments, language, VAD speech.
+- **`<stem>.vtt`** — editable subtitles. By default cues carry word-level timestamps (same
+  precision as `align` output, ready to use); `--no-timestamps` writes a plain-text editing
+  draft for hand-correction, which `align` re-times.
+
+Both VTT forms are accepted by `align`. The aligner strips punctuation as a hard constraint;
+ASR punctuation is re-injected by time so the final output has correct spacing and breaks
+without stray marks.
+
+## Testing
+
+- Unit tests (models mocked, no network): `make test` (= `uv run pytest tests/`)
+- Lint / format: `make lint`
+
+## Support
+
+If VoxWeave saves you time, you can support development here:
+
+<a href="https://buymeacoffee.com/hali0515"><img src="https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?logo=buymeacoffee&logoColor=black" alt="Buy Me A Coffee"/></a>
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Acknowledgments
+
+- [WhisperX](https://github.com/m-bain/whisperX) — the forced-alignment + edit-and-resync
+  workflow this project builds on; the Japanese MMS full-file alignment path is a faithful
+  port of its `ctc` align backend.
+- [stable-ts](https://github.com/jianfch/stable-ts) — inspiration for timestamp post-processing
+  and documentation structure.
+- [Qwen3-ASR / Qwen3-ForcedAligner](https://github.com/QwenLM) (Alibaba) — local ASR + aligner.
+- [MMS-300m](https://github.com/facebookresearch/fairseq/tree/main/examples/mms) (Meta) via
+  [ctc-forced-aligner](https://github.com/MahmoudAshraf97/ctc-forced-aligner) — zero-OOV CJK alignment.
+- [Mel-Band Roformer](https://github.com/lucidrains/BS-RoFormer) (lucidrains) +
+  [KimberleyJSN](https://huggingface.co/KimberleyJSN/melbandroformer) weights — vocal separation.
+- [BudouX](https://github.com/google/budoux), [jieba](https://github.com/fxsjy/jieba),
+  [PySBD](https://github.com/nipunsadvilkar/pySBD) — CJK/sentence line-break.
+- [PANNs](https://github.com/qiuqiangkong/audioset_tagging_cnn) — song/music detection.
+- [Silero VAD](https://github.com/snakers4/silero-vad) — voice activity detection.

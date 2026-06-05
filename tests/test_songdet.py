@@ -1,0 +1,300 @@
+import numpy as np
+
+from voxweave.songdet import (
+    IDX_MUSIC,
+    IDX_SING,
+    IDX_SPEECH,
+    drop_segments_in_spans,
+    expand_spans_to_voiced_blocks,
+    filter_short_spans,
+    group_segments_by_spans,
+    merge_spans,
+    sing_flags,
+    song_flags,
+    speech_flags,
+)
+
+
+def _probs(rows: list[dict]) -> np.ndarray:
+    """rows: per-window dicts {'speech':v,'sing':v,'music':v} -> (n,527) probability matrix."""
+    p = np.zeros((len(rows), 527), dtype="float32")
+    for i, r in enumerate(rows):
+        p[i, IDX_SPEECH[0]] = r.get("speech", 0.0)
+        p[i, IDX_SING[0]] = r.get("sing", 0.0)
+        p[i, IDX_MUSIC[0]] = r.get("music", 0.0)
+    return p
+
+
+def test_song_flags_speech_not_flagged():
+    p = _probs([{"speech": 0.8, "sing": 0.0, "music": 0.05}])
+    assert song_flags(p).tolist() == [False]
+
+
+def test_song_flags_singing_flagged():
+    # sing exceeds speech and > 0.15
+    p = _probs([{"speech": 0.05, "sing": 0.5, "music": 0.1}])
+    assert song_flags(p).tolist() == [True]
+
+
+def test_song_flags_music_low_speech_flagged():
+    # music>0.30 and speech<0.25 -> counts as music even with low sing
+    p = _probs([{"speech": 0.10, "sing": 0.05, "music": 0.6}])
+    assert song_flags(p).tolist() == [True]
+
+
+def test_song_flags_dialogue_over_bgm_not_flagged():
+    # dialogue over BGM: speech is high -> not flagged (music on separated vocals is already low; this tests the criterion itself)
+    p = _probs([{"speech": 0.7, "sing": 0.0, "music": 0.6}])
+    assert song_flags(p).tolist() == [False]
+
+
+def test_song_flags_silence_baseline_not_flagged():
+    p = _probs([{"speech": 0.05, "sing": 0.0, "music": 0.13}])
+    assert song_flags(p).tolist() == [False]
+
+
+def test_merge_spans_contiguous():
+    flags = np.array([True, True, True])
+    spans = merge_spans(flags, [0.0, 1.0, 2.0])
+    assert spans == [(0.0, 4.0)]  # win=2, last window start=2 -> end=4
+
+
+def test_merge_spans_drops_short():
+    flags = np.array([True, False, False])
+    # single window [0,2] length 2 < min_span 3 -> dropped
+    assert merge_spans(flags, [0.0, 1.0, 2.0]) == []
+
+
+def test_merge_spans_splits_on_gap():
+    # starts 0,1 (song) then 6,7 (song), gap 6-2=4 > gap_merge 2 -> two separate spans
+    flags = np.array([True, True, False, False, False, False, True, True])
+    starts = [float(i) for i in range(8)]
+    spans = merge_spans(flags, starts)
+    assert spans == [(0.0, 3.0), (6.0, 9.0)]
+
+
+def test_drop_segments_in_spans():
+    spans = [(10.0, 20.0)]
+    segs = [
+        {"start": 0.0, "end": 5.0},  # outside: kept
+        {"start": 12.0, "end": 18.0},  # fully inside: dropped
+        {"start": 8.0, "end": 12.0},  # overlap 2/4=0.5 >= 0.5: dropped
+        {"start": 8.0, "end": 11.0},  # overlap 1/3~0.33 < 0.5: kept
+    ]
+    kept = drop_segments_in_spans(segs, segs and spans)
+    assert kept == [{"start": 0.0, "end": 5.0}, {"start": 8.0, "end": 11.0}]
+
+
+def test_drop_segments_no_spans_keeps_all():
+    segs = [{"start": 0.0, "end": 5.0}]
+    assert drop_segments_in_spans(segs, []) == segs
+
+
+def test_expand_spans_grabs_rap_in_same_block():
+    # OP: rap verse 36-64 (PANNs classifies as speech) + singing chorus 66-86; one continuous voiced block.
+    # Only chorus detected (65-86) -> expanded to full block 36-86, pulling in the rap.
+    segs = [
+        {"start": 36.0, "end": 50.0},
+        {"start": 52.0, "end": 64.0},
+        {"start": 66.0, "end": 86.0},
+        {
+            "start": 99.0,
+            "end": 120.0,
+        },  # second singing segment, 13s true silence away -> separate block
+    ]
+    spans = [(65.0, 86.0), (99.0, 120.0)]
+    out = expand_spans_to_voiced_blocks(segs, spans)
+    assert out == [(36.0, 86.0), (99.0, 120.0)]
+
+
+def test_expand_spans_does_not_eat_far_dialogue():
+    # dialogue block (159-180) separated from song span by silence -> not absorbed
+    segs = [
+        {"start": 60.0, "end": 86.0},
+        {"start": 159.0, "end": 170.0},
+        {"start": 171.0, "end": 180.0},
+    ]
+    spans = [(65.0, 86.0)]
+    out = expand_spans_to_voiced_blocks(segs, spans)
+    assert out == [(60.0, 86.0)]
+
+
+def test_expand_spans_empty_noop():
+    segs = [{"start": 0.0, "end": 5.0}]
+    assert expand_spans_to_voiced_blocks(segs, []) == []
+
+
+# --------------------------------------------------------------------------- #
+# sing_flags + expandable gate on expansion (fixes mid-stream BGM absorbing dialogue)
+# --------------------------------------------------------------------------- #
+def test_sing_flags_singing_true():
+    p = _probs([{"speech": 0.05, "sing": 0.5, "music": 0.1}])
+    assert sing_flags(p).tolist() == [True]
+
+
+def test_sing_flags_pure_music_false():
+    # pure-instrumental BGM: music dominant, sing~0 -> not classified as "contains singing" (though song_flags still flags it as music)
+    p = _probs([{"speech": 0.07, "sing": 0.04, "music": 0.72}])
+    assert sing_flags(p).tolist() == [False]
+    assert song_flags(p).tolist() == [True]
+
+
+def test_sing_flags_speech_false():
+    p = _probs([{"speech": 0.8, "sing": 0.0, "music": 0.05}])
+    assert sing_flags(p).tolist() == [False]
+
+
+def test_expand_music_only_span_does_not_eat_following_speech():
+    # Reproduces real bug: BGM (148-151, pure instrumental) ends and the host speaks immediately (153-156, same voiced block, gap<3s).
+    # Pure-instrumental span is not in expandable -> does not absorb the whole block -> speech segments 153/155 are preserved.
+    segs = [
+        {"start": 148.5, "end": 149.5},  # BGM
+        {"start": 150.4, "end": 150.9},  # BGM
+        {"start": 153.0, "end": 153.8},  # speech
+        {"start": 155.4, "end": 156.3},  # speech
+    ]
+    spans = [(148.0, 151.0)]  # pure-instrumental span detected
+    out = expand_spans_to_voiced_blocks(segs, spans, expandable=[])
+    assert out == [(148.0, 151.0)]  # no expansion
+    kept = drop_segments_in_spans(segs, out)
+    assert {"start": 153.0, "end": 153.8} in kept  # speech preserved
+    assert {"start": 155.4, "end": 156.3} in kept
+
+
+def test_filter_short_spans_drops_brief_bgm():
+    # 3s misclassified instrumental BGM dropped (transcribe as content, not skip); real OP/ED long spans kept (skipped)
+    spans = [(148.0, 151.0), (10.0, 80.0)]
+    assert filter_short_spans(spans, min_sec=8.0) == [(10.0, 80.0)]
+
+
+def test_filter_short_spans_keeps_all_when_long():
+    spans = [(10.0, 80.0), (100.0, 160.0)]
+    assert filter_short_spans(spans, min_sec=8.0) == spans
+
+
+def test_filter_short_spans_empty():
+    assert filter_short_spans([], min_sec=8.0) == []
+
+
+def test_expand_singing_span_still_grabs_rap_with_expandable():
+    # singing span is in expandable -> still expands to grab rap in the same block (no regression)
+    segs = [
+        {"start": 36.0, "end": 50.0},  # rap (classified as speech)
+        {"start": 52.0, "end": 64.0},  # rap
+        {"start": 66.0, "end": 86.0},  # singing chorus (detected)
+    ]
+    spans = [(65.0, 86.0)]
+    out = expand_spans_to_voiced_blocks(segs, spans, expandable=[(65.0, 86.0)])
+    assert out == [(36.0, 86.0)]
+
+
+# --------------------------------------------------------------------------- #
+# clean-dialogue signature + expansion edge-trimming (fixes ED singing span overshooting and absorbing adjacent dialogue)
+# --------------------------------------------------------------------------- #
+def test_speech_flags_clean_dialogue_true():
+    # clean dialogue on separated vocals: speech dominant, almost no singing/instrumental residue
+    p = _probs([{"speech": 0.7, "sing": 0.0, "music": 0.05}])
+    assert speech_flags(p).tolist() == [True]
+
+
+def test_speech_flags_song_false():
+    p = _probs([{"speech": 0.05, "sing": 0.3, "music": 0.4}])
+    assert speech_flags(p).tolist() == [False]
+
+
+def test_speech_flags_rap_with_residual_music_false():
+    # carries rhythmic/instrumental residue (music>=0.2 or sing>=0.1) -> not clean dialogue
+    # -> rap verse is NOT trimmed as dialogue (preserves pit-2 protection)
+    assert speech_flags(
+        _probs([{"speech": 0.7, "sing": 0.0, "music": 0.25}])
+    ).tolist() == [False]
+    assert speech_flags(
+        _probs([{"speech": 0.7, "sing": 0.15, "music": 0.05}])
+    ).tolist() == [False]
+
+
+def test_speech_flags_quiet_pause_false():
+    # speech score too low (pause / soft voice) -> not flagged as clean dialogue
+    p = _probs([{"speech": 0.3, "sing": 0.0, "music": 0.05}])
+    assert speech_flags(p).tolist() == [False]
+
+
+def test_expand_trims_leading_clean_speech_dialogue():
+    # Real ED bug (block A): dialogue 1226-1264 is flush against the ED opening 1266-1356, same voiced block (gap<3, ED is singing).
+    # protect marks the dialogue -> expansion trims it from the left edge, keeping only the song core -> dialogue not absorbed.
+    segs = [
+        {"start": 1226.0, "end": 1264.0},  # dialogue (clean speech)
+        {"start": 1266.0, "end": 1271.0},  # ED opening (singing)
+        {"start": 1273.0, "end": 1356.0},  # ED body (singing)
+    ]
+    spans = [(1266.0, 1356.0)]
+    out = expand_spans_to_voiced_blocks(
+        segs, spans, expandable=spans, protect=[(1226.0, 1264.0)]
+    )
+    assert out == [(1266.0, 1356.0)]  # dialogue 1226-1264 preserved
+
+
+def test_expand_trims_trailing_clean_speech_dialogue():
+    # Block C: ED tail 1320-1356 + dialogue 1357-1410 in same block -> trailing dialogue trimmed
+    segs = [
+        {"start": 1320.0, "end": 1356.0},  # ED tail (singing)
+        {"start": 1357.0, "end": 1410.0},  # dialogue
+    ]
+    spans = [(1266.0, 1356.0)]
+    out = expand_spans_to_voiced_blocks(
+        segs, spans, expandable=spans, protect=[(1357.0, 1410.0)]
+    )
+    assert out == [(1266.0, 1356.0)]  # trailing dialogue preserved
+
+
+def test_expand_keeps_interior_rap_between_choruses():
+    # Pit-2 no regression: rap verse between two choruses (interior to the block) -> NOT trimmed even if protect marks it; whole block absorbed
+    segs = [
+        {"start": 66.0, "end": 80.0},  # chorus1 (singing, detected)
+        {"start": 82.0, "end": 96.0},  # rap verse (clean speech, interior)
+        {"start": 98.0, "end": 112.0},  # chorus2 (singing, detected)
+    ]
+    spans = [(66.0, 80.0), (98.0, 112.0)]
+    out = expand_spans_to_voiced_blocks(
+        segs, spans, expandable=spans, protect=[(82.0, 96.0)]
+    )
+    assert out == [(66.0, 112.0)]  # interior verse stays within the song span
+
+
+def test_expand_no_protect_is_legacy_whole_block():
+    # protect=None (default) -> legacy whole-block absorption behavior, backward compatible
+    segs = [
+        {"start": 1226.0, "end": 1264.0},
+        {"start": 1266.0, "end": 1271.0},
+        {"start": 1273.0, "end": 1356.0},
+    ]
+    spans = [(1266.0, 1356.0)]
+    out = expand_spans_to_voiced_blocks(segs, spans, expandable=spans)
+    assert out == [(1226.0, 1356.0)]  # blindly absorbs the whole block
+
+
+def test_group_segments_breaks_at_span():
+    # song span 65-86 falls between segments 60-64 and 123-130 -> split into two groups
+    spans = [(65.0, 86.0), (99.0, 120.0)]
+    segs = [
+        {"start": 55.0, "end": 60.0},
+        {"start": 60.0, "end": 64.0},
+        {"start": 123.0, "end": 130.0},
+    ]
+    groups = group_segments_by_spans(segs, spans)
+    assert groups == [
+        [{"start": 55.0, "end": 60.0}, {"start": 60.0, "end": 64.0}],
+        [{"start": 123.0, "end": 130.0}],
+    ]
+
+
+def test_group_segments_no_span_between_stays_one():
+    spans = [(200.0, 210.0)]
+    segs = [{"start": 10.0, "end": 20.0}, {"start": 21.0, "end": 30.0}]
+    assert group_segments_by_spans(segs, segs and spans) == [segs]
+
+
+def test_group_segments_no_spans():
+    segs = [{"start": 0.0, "end": 5.0}]
+    assert group_segments_by_spans(segs, []) == [segs]
+    assert group_segments_by_spans([], [(1.0, 2.0)]) == []
