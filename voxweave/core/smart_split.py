@@ -16,14 +16,15 @@ from __future__ import annotations
 
 import functools
 import re
+from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Optional, Tuple
 
 from .conjunctions import conjunctions_by_language, get_comma
 from .breakpoints import legal_break_index, phrase_atoms
 from .gap_split import gap_qualifies
 from .kinsoku import line_end_penalty
+from .langsets import LANGUAGES_WITHOUT_SPACES
 
-LANGUAGES_WITHOUT_SPACES = {"zh", "ja", "th", "lo", "my"}
 # Languages whose glyphs render at ~2x the visual width of Latin chars,
 # so the per-line character budget must be roughly halved.
 WIDE_GLYPH_LANGUAGES = {"zh", "ja", "ko"}
@@ -74,9 +75,13 @@ def default_comma_split_min_len(lang: str) -> int:
     )
 
 
-# Comma variants for no-space langs: treated as clause boundaries and later
-# stripped to a space by _PUNCT_TO_SPACE_RE. Must mirror that regex's comma set.
-_PAUSE_COMMAS_NO_SPACE = "，、,﹐﹑"  # fullwidth, ideographic, halfwidth, small
+# Comma variants for no-space langs: treated as clause boundaries and later stripped to a space
+# by _PUNCT_TO_SPACE_RE. The CJK subset is the single source for both this boundary set and that
+# regex (halfwidth "," is added here but lives in the regex's digit-guarded first branch).
+_CJK_PAUSE_COMMAS = (
+    "，、﹐﹑"  # fullwidth, ideographic, small comma, small ideographic comma
+)
+_PAUSE_COMMAS_NO_SPACE = "," + _CJK_PAUSE_COMMAS  # + halfwidth comma
 
 
 def _comma_chars(lang: str) -> str:
@@ -210,6 +215,20 @@ def _token_char_count(tok: str) -> int:
     return sum(1 for c in tok if not c.isspace())
 
 
+def _span_start(items: list[dict], default: float | None = None) -> float | None:
+    """First non-None ``start`` across items, else ``default``."""
+    return next(
+        (it.get("start") for it in items if it.get("start") is not None), default
+    )
+
+
+def _span_end(items: list[dict], default: float | None = None) -> float | None:
+    """Last non-None ``end`` across items, else ``default``."""
+    return next(
+        (it.get("end") for it in reversed(items) if it.get("end") is not None), default
+    )
+
+
 def _build_atoms(text: str, word_data: list[dict], lang: str) -> list[dict]:
     """Build non-breakable atoms, each with aggregated start/end from word_data.
 
@@ -235,13 +254,9 @@ def _build_atoms(text: str, word_data: list[dict], lang: str) -> list[dict]:
         n = _token_char_count(unit)
         chunk = word_data[cursor : cursor + n]
         cursor += n
-        start = next(
-            (c.get("start") for c in chunk if c.get("start") is not None), None
+        atoms.append(
+            {"text": unit, "start": _span_start(chunk), "end": _span_end(chunk)}
         )
-        end = next(
-            (c.get("end") for c in reversed(chunk) if c.get("end") is not None), None
-        )
-        atoms.append({"text": unit, "start": start, "end": end})
     return atoms
 
 
@@ -491,6 +506,131 @@ def _best_len_break_pos(
     return min(cands, key=lambda pk: (pk[0], -pk[1]))[1]
 
 
+def _classify_atom_break(
+    cur: List[dict],
+    atom: dict,
+    *,
+    at_boundary: bool,
+    has_boundary: bool,
+    do_new: bool,
+    th: SplitThresholds,
+    speech_spans: list[tuple[float, float]] | None,
+    max_line_length: int,
+    max_lines: int,
+    lang: str,
+) -> tuple[bool, bool, bool]:
+    """Decide ``(gap_break, dur_break, len_break)`` for appending ``atom`` after ``cur``.
+
+    Pure: reads ``cur``/``atom``/thresholds, mutates nothing. All-False when ``cur`` is empty
+    (the first atom of a chunk never breaks).
+    - gap_break: a qualifying inter-atom pause, but only at a phrase boundary, and suppressed in
+      the clause_ms..vad_skip_ms zone when it would strand a sticky particle at line end.
+    - dur_break: hard last-resort cap when the running cue would exceed ``max_cue_s`` (ignores
+      word boundaries — intra-word spans over the cap are rare and an overlong cue is worse).
+    - len_break: the line budget overflows AND this atom is a legal (phrase-start) break point.
+    """
+    if not cur:
+        return False, False, False
+    prev = cur[-1]
+    # Gap/len breaks require a word boundary (no-space langs): atom must be a BudouX(ja)/jieba(zh)
+    # phrase start. Guards against CTC timing errors on OOV chars creating spurious intra-word gaps
+    # (e.g. 酒造り: 番酒造 OOV drift makes a 2.1s gap between 造 and り, but BudouX keeps 番酒造りが
+    # as one phrase, suppressing the spurious split). The dur_break cap is exempt and always cuts.
+    gap_break = (
+        do_new
+        and at_boundary
+        and gap_qualifies(
+            prev.get("end"),
+            atom.get("start"),
+            speech_spans,
+            clause_ms=th.clause_ms,
+            vad_skip_ms=th.vad_skip_ms,
+            offline_ms=th.offline_ms,
+        )
+    )
+    # In the clause_ms..vad_skip_ms zone, suppress the gap-split if it would strand a sticky
+    # particle at line end (大樹の|村 → keep 大樹の村 together). True silence (>=vad_skip_ms) cuts.
+    if gap_break and has_boundary and line_end_penalty(prev["text"]) >= 2:
+        gms = _gap_ms(prev.get("end"), atom.get("start"))
+        if gms is not None and th.clause_ms <= gms < th.vad_skip_ms:
+            gap_break = False
+    tentative = _join([a["text"] for a in cur + [atom]], lang)
+    len_overflow = (
+        split_subtitle(tentative, max_line_length, lang).count("\n") + 1 > max_lines
+    )
+    len_break = len_overflow and at_boundary
+    start0 = _span_start(cur)
+    dur_break = (
+        do_new
+        and start0 is not None
+        and atom.get("end") is not None
+        and (atom["end"] - start0) > th.max_cue_s
+    )
+    return gap_break, dur_break, len_break
+
+
+def _pack_atoms_into_chunks(
+    atoms: List[dict],
+    *,
+    boundary: set[int] | None,
+    do_new: bool,
+    th: SplitThresholds,
+    speech_spans: list[tuple[float, float]] | None,
+    max_line_length: int,
+    max_lines: int,
+    lang: str,
+) -> List[List[dict]]:
+    """Greedily pack atoms into chunks, cutting on the first qualifying gap/dur/len break.
+
+    Time-forced breaks (gap/dur) cut immediately; a length overflow picks the phrase-boundary
+    candidate with the smallest sticky-particle penalty via ``_best_len_break_pos`` (Level 1).
+    """
+    has_boundary = boundary is not None
+    chunks: List[List[dict]] = []
+    cur: List[dict] = []
+    cur_bnd: List[
+        bool
+    ] = []  # parallel to cur: True = phrase-start (legal len-break point)
+    for i, atom in enumerate(atoms):
+        at_boundary = boundary is None or i in boundary
+        gap_break, dur_break, len_break = _classify_atom_break(
+            cur,
+            atom,
+            at_boundary=at_boundary,
+            has_boundary=has_boundary,
+            do_new=do_new,
+            th=th,
+            speech_spans=speech_spans,
+            max_line_length=max_line_length,
+            max_lines=max_lines,
+            lang=lang,
+        )
+        if cur and (gap_break or dur_break):
+            chunks.append(cur)
+            cur, cur_bnd = [atom], [at_boundary]
+        elif cur and len_break:
+            k = _best_len_break_pos(cur, cur_bnd, at_boundary)
+            chunks.append(cur[:k])
+            cur, cur_bnd = cur[k:] + [atom], cur_bnd[k:] + [at_boundary]
+        else:
+            cur.append(atom)
+            cur_bnd.append(at_boundary)
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _chunk_to_cue(chunk: List[dict], cue: Dict[str, Any], lang: str) -> Dict[str, Any]:
+    """Materialize a packed atom chunk into a cue dict (first/last non-None span, falling back
+    to the parent cue's start/end)."""
+    return {
+        "text": _join([a["text"] for a in chunk], lang),
+        "start": _span_start(chunk, cue["start"]),
+        "end": _span_end(chunk, cue["end"]),
+        "word_data": [{"start": a["start"], "end": a["end"]} for a in chunk],
+    }
+
+
 def split_long_cues_with_word_timings(
     cues: List[Dict[str, Any]],
     max_line_length: int,
@@ -499,21 +639,18 @@ def split_long_cues_with_word_timings(
     desired_wps: float,
     lang: str,
     speech_spans: list[tuple[float, float]] | None = None,
-    thresholds: Optional[Dict[str, Any]] = None,
+    thresholds: Optional[SplitThresholds] = None,
 ) -> List[Dict[str, Any]]:
-    # min_duration / desired_wps kept for back-compat; not used in the atom-based path
-    th = (
-        thresholds
-        if thresholds is not None
-        else {
-            "clause_ms": 400,
-            "vad_skip_ms": 1000,
-            "offline_ms": 700,
-            "max_cue_s": 7.0,
-        }
-    )
-    new_cues: List[Dict[str, Any]] = []
+    """Pack each cue's atoms into reading-sized cues using gap/duration/length breaks.
 
+    ``min_duration`` / ``desired_wps`` are kept for back-compat (unused on the atom-based path).
+    ``thresholds=None`` is the legacy length-break-only path: ``do_new=False`` disables the
+    gap/duration breaks, so the threshold values are never read (the default instance is a
+    never-read placeholder there).
+    """
+    do_new = thresholds is not None
+    th = thresholds if thresholds is not None else SplitThresholds()
+    new_cues: List[Dict[str, Any]] = []
     for cue in cues:
         word_data = list(cue.get("word_data") or [])
         if not word_data:
@@ -521,102 +658,23 @@ def split_long_cues_with_word_timings(
                 _split_without_timings(cue, max_line_length, max_lines, lang)
             )
             continue
-
         atoms = _build_atoms(cue["text"], word_data, lang)
-        do_new = (
-            thresholds is not None
-        )  # gap/dur-cap mode; legacy path keeps len-break only
         boundary = (
             _phrase_boundary_atoms(atoms, cue["text"], lang)
             if do_new and _no_spaces(lang)
             else None
         )
-        chunks: List[List[dict]] = []
-        cur: List[dict] = []
-        cur_bnd: List[
-            bool
-        ] = []  # parallel to cur: True = phrase-start (legal len-break point)
-        for i, atom in enumerate(atoms):
-            gap_break = False
-            dur_break = False
-            len_break = False
-            at_boundary = boundary is None or i in boundary
-            if cur:
-                prev = cur[-1]
-                # Gap/len breaks require a word boundary (no-space langs): atom[i] must be a
-                # BudouX(ja)/jieba(zh) phrase start. This guards against CTC timing errors on
-                # OOV chars creating spurious intra-word gaps — e.g. 酒造り: 番酒造 OOV drift
-                # makes a 2.1s gap between 造 and り, but BudouX keeps 番酒造りが as one phrase,
-                # suppressing the spurious split. The hard dur_break cap is exempt and always cuts.
-                gap_break = (
-                    do_new
-                    and at_boundary
-                    and gap_qualifies(
-                        prev.get("end"),
-                        atom.get("start"),
-                        speech_spans,
-                        clause_ms=th["clause_ms"],
-                        vad_skip_ms=th["vad_skip_ms"],
-                        offline_ms=th["offline_ms"],
-                    )
-                )
-                # In the clause_ms..vad_skip_ms zone: suppress the gap-split if it would strand
-                # a sticky particle at line end (e.g. 大樹の|村 → keep 大樹の村 together).
-                # True silence (>=vad_skip_ms) cuts unconditionally and is not suppressed.
-                if (
-                    gap_break
-                    and boundary is not None
-                    and line_end_penalty(prev["text"]) >= 2
-                ):
-                    gms = _gap_ms(prev.get("end"), atom.get("start"))
-                    if gms is not None and th["clause_ms"] <= gms < th["vad_skip_ms"]:
-                        gap_break = False
-                tentative = _join([a["text"] for a in cur + [atom]], lang)
-                len_overflow = (
-                    split_subtitle(tentative, max_line_length, lang).count("\n") + 1
-                    > max_lines
-                )
-                len_break = len_overflow and at_boundary
-                start0 = next((a["start"] for a in cur if a["start"] is not None), None)
-                # dur_break ignores word boundaries: it's the hard cap of last resort.
-                # Intra-word spans >7s are extremely rare; hard-cutting is better than an
-                # overlong cue.
-                if do_new and start0 is not None and atom.get("end") is not None:
-                    dur_break = (atom["end"] - start0) > th["max_cue_s"]
-            # Time-forced breaks (gap/dur) cut immediately; length overflow picks the
-            # phrase-boundary candidate with the smallest sticky-particle penalty (Level 1).
-            if cur and (gap_break or dur_break):
-                chunks.append(cur)
-                cur, cur_bnd = [atom], [at_boundary]
-            elif cur and len_break:
-                k = _best_len_break_pos(cur, cur_bnd, at_boundary)
-                chunks.append(cur[:k])
-                cur, cur_bnd = cur[k:] + [atom], cur_bnd[k:] + [at_boundary]
-            else:
-                cur.append(atom)
-                cur_bnd.append(at_boundary)
-        if cur:
-            chunks.append(cur)
-
-        for chunk in chunks:
-            text = _join([a["text"] for a in chunk], lang)
-            start = next(
-                (a["start"] for a in chunk if a["start"] is not None), cue["start"]
-            )
-            end = next(
-                (a["end"] for a in reversed(chunk) if a["end"] is not None), cue["end"]
-            )
-            new_cues.append(
-                {
-                    "text": text,
-                    "start": start,
-                    "end": end,
-                    "word_data": [
-                        {"start": a["start"], "end": a["end"]} for a in chunk
-                    ],
-                }
-            )
-
+        chunks = _pack_atoms_into_chunks(
+            atoms,
+            boundary=boundary,
+            do_new=do_new,
+            th=th,
+            speech_spans=speech_spans,
+            max_line_length=max_line_length,
+            max_lines=max_lines,
+            lang=lang,
+        )
+        new_cues.extend(_chunk_to_cue(chunk, cue, lang) for chunk in chunks)
     return new_cues
 
 
@@ -659,6 +717,30 @@ TWO_FRAME_S = 2.0 / 24.0  # ~0.083s Netflix min inter-cue gap
 CHAIN_MAX_GAP_S = 0.5  # gaps below this are "dead zone" -> chain to 2 frames
 VISIBLE_GAP_MIN_S = 1.0  # gaps >= this stay a visible pause (BBC); not enforced in code (CHAIN_MAX_GAP_S=0.5 never reaches them)
 GLUE_MAX_GAP_S = 0.3  # lone-word flicker cue glues onto its nearer neighbor when that gap is below this
+
+
+@dataclass(frozen=True)
+class SplitThresholds:
+    """Gap-aware segmentation knobs — one typed source for field names + defaults.
+
+    Built from ``config.gap_thresholds()``'s mapping at the ``smart_split_segments`` boundary via
+    :meth:`from_mapping`. Passing ``thresholds=None`` to ``smart_split_segments`` selects the
+    legacy length-break-only path (gap/duration breaks and the cleanup pass are skipped), so these
+    values are only read in gap-aware mode.
+    """
+
+    clause_ms: int = 400
+    vad_skip_ms: int = 1000
+    offline_ms: int = 700
+    min_cue_s: float = 0.5
+    max_cue_s: float = 7.0
+    glue_gap_s: float = GLUE_MAX_GAP_S
+
+    @classmethod
+    def from_mapping(cls, d: dict) -> SplitThresholds:
+        """Build from a (possibly partial) mapping, ignoring unknown keys and filling defaults."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 def _is_short_fragment(text: str, lang: str) -> bool:
@@ -786,7 +868,7 @@ def smart_split_segments(
     comma_split_min_len: Optional[int] = None,
     *,
     speech_spans: list[tuple[float, float]] | None = None,
-    thresholds: Optional[Dict[str, Any]] = None,
+    thresholds: SplitThresholds | dict | None = None,
 ) -> List[Dict[str, Any]]:
     """Run the full smart-split pipeline over aligned segments.
 
@@ -802,6 +884,13 @@ def smart_split_segments(
         max_line_length = default_max_line_length(lang)
     if max_lines is None:
         max_lines = default_max_lines(lang)  # ja -> 1 (single line), else 2
+    # Accept a plain mapping (config.gap_thresholds / tests) and normalize to the typed form once.
+    # th is None ⟺ legacy length-break-only mode (no gap/duration breaks, no cleanup pass).
+    th = (
+        SplitThresholds.from_mapping(thresholds)
+        if isinstance(thresholds, dict)
+        else thresholds
+    )
     all_cues: List[Dict[str, Any]] = []
     for segment in segments:
         text = segment.get("text", "")
@@ -827,20 +916,14 @@ def smart_split_segments(
         desired_wps=desired_wps,
         lang=lang,
         speech_spans=speech_spans,
-        thresholds=thresholds,
+        thresholds=th,
     )
-    if thresholds is not None:  # cleanup opt-in; legacy callers skip this
-        cues = _glue_short_cues(
-            cues, lang, max_gap_s=thresholds.get("glue_gap_s", GLUE_MAX_GAP_S)
-        )
-        cues = _cleanup_cues(
-            cues,
-            min_cue_s=thresholds.get("min_cue_s", 0.5),
-            max_cue_s=thresholds.get("max_cue_s", 7.0),
-        )
+    if th is not None:  # cleanup opt-in; legacy callers skip this
+        cues = _glue_short_cues(cues, lang, max_gap_s=th.glue_gap_s)
+        cues = _cleanup_cues(cues, min_cue_s=th.min_cue_s, max_cue_s=th.max_cue_s)
     for cue in cues:
         cue["text"] = _strip_punct_for_subtitles(cue["text"])
-        if thresholds is not None:  # stutter merging opt-in alongside gap-aware mode
+        if th is not None:  # stutter merging opt-in alongside gap-aware mode
             cue["text"] = _merge_stutters(cue["text"])
         # Display soft-wrap: fold over-budget cues into <=max_lines lines without
         # changing cue boundaries. Long Latin phrases inside CJK also collapse here.
@@ -869,7 +952,9 @@ def _merge_stutters(text: str) -> str:
 # (e.g. 3.75, 10,000). Covers CJK fullwidth variants.
 _PUNCT_TO_SPACE_RE = re.compile(
     r"[.,](?!\d)"  # latin . , only when next char is not a digit
-    r"|[;!?:、，。；！？：﹐﹑﹒﹔﹕﹖﹗]"  # halfwidth ; ! ? : and CJK fullwidth set
+    r"|[;!?:。；！？：﹒﹔﹕﹖﹗"
+    + _CJK_PAUSE_COMMAS
+    + r"]"  # halfwidth punct + CJK set (commas shared)
 )
 _WS_RE = re.compile(r"\s+")
 
