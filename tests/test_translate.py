@@ -88,6 +88,13 @@ def test_parse_response_garbage_returns_empty():
     assert translate.parse_response("not json at all") == {}
 
 
+def test_parse_response_non_str_non_dict_tolerated():
+    # non-str/non-dict input must fall through to {} (not raise TypeError from json.loads)
+    assert translate.parse_response(None) == {}
+    assert translate.parse_response(123) == {}
+    assert translate.parse_response([{"i": 0, "t": "x"}]) == {}
+
+
 def test_parse_response_ignores_trailing_prose_with_braces():
     raw = '{"translations": [{"i": 0, "t": "x"}]} 备注: 用 {} 表示空'
     assert translate.parse_response(raw) == {0: "x"}

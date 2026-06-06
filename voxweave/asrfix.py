@@ -19,8 +19,14 @@ import json
 import logging
 import os
 
-from voxweave.realign import fmt_ts
-from voxweave.translate import _call, _make_client, build_payload, format_glossary
+from voxweave.realign import render_cues
+from voxweave.translate import (
+    _call,
+    _loads_salvage,
+    _make_client,
+    build_payload,
+    format_glossary,
+)
 
 log = logging.getLogger("voxweave")
 
@@ -90,22 +96,10 @@ def build_messages(
     ]
 
 
-def parse_fixes(raw: str | dict) -> list[dict]:
+def parse_fixes(raw: object) -> list[dict]:
     """Model response → list of ``{i, orig, fixed, reason}``; salvages the first
     JSON object from dirty text, returns [] on failure."""
-    obj = raw
-    if isinstance(raw, str):
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError:
-            start = raw.find("{")
-            if start < 0:
-                return []
-            try:
-                obj, _ = json.JSONDecoder().raw_decode(raw[start:])
-            except json.JSONDecodeError:
-                return []
-    items = obj.get("fixes", []) if isinstance(obj, dict) else []
+    items = _loads_salvage(raw).get("fixes", [])
     out: list[dict] = []
     for it in items:
         if not isinstance(it, dict):
@@ -164,13 +158,9 @@ def apply_fixes(
 def render_vtt(blocks: list[dict], texts: list[str]) -> str:
     """Render cues with corrected ``texts``, preserving each block's timestamps
     when present (text-only otherwise). Structure-preserving: one cue in, one out."""
-    out = ["WEBVTT", ""]
-    for b, text in zip(blocks, texts):
-        if b.get("start") is not None and b.get("end") is not None:
-            out.append(f"{fmt_ts(b['start'])} --> {fmt_ts(b['end'])}")
-        out.append(text)
-        out.append("")
-    return "\n".join(out).rstrip() + "\n"
+    return render_cues(
+        [(b.get("start"), b.get("end"), text) for b, text in zip(blocks, texts)]
+    )
 
 
 def correct_cues(

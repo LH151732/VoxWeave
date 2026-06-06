@@ -44,6 +44,13 @@ def test_parse_fixes_garbage_returns_empty():
     assert asrfix.parse_fixes("not json at all") == []
 
 
+def test_parse_fixes_non_str_non_dict_tolerated():
+    # non-str/non-dict input must fall through to [] (not raise TypeError from json.loads)
+    assert asrfix.parse_fixes(None) == []
+    assert asrfix.parse_fixes(123) == []
+    assert asrfix.parse_fixes([{"i": 0}]) == []
+
+
 # --------------------------- apply_fixes (SAFETY GATE) --------------------------- #
 def test_apply_fixes_applies_matching():
     blocks = _blocks(["如金仍是主力", "下一句"])

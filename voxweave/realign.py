@@ -845,11 +845,21 @@ def fmt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:06.3f}"
 
 
-def render_vtt(blocks: list[dict], spans: list[tuple[float, float]]) -> str:
-    """Block text + timestamps → standard timestamped VTT string."""
+def render_cues(rows: list[tuple[float | None, float | None, str]]) -> str:
+    """Render WEBVTT from ``(start, end, text)`` rows: a timestamp line is emitted when both
+    start and end are present, otherwise the cue is plain text.
+
+    Single source for the WEBVTT skeleton shared by realign / translate / asrfix / pipeline.
+    """
     out = ["WEBVTT", ""]
-    for b, (a, e) in zip(blocks, spans):
-        out.append(f"{fmt_ts(a)} --> {fmt_ts(e)}")
-        out.append(b["text"])
+    for start, end, text in rows:
+        if start is not None and end is not None:
+            out.append(f"{fmt_ts(start)} --> {fmt_ts(end)}")
+        out.append(text)
         out.append("")
     return "\n".join(out).rstrip() + "\n"
+
+
+def render_vtt(blocks: list[dict], spans: list[tuple[float, float]]) -> str:
+    """Block text + timestamps → standard timestamped VTT string."""
+    return render_cues([(a, e, b["text"]) for b, (a, e) in zip(blocks, spans)])

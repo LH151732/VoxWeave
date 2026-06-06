@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import functools
 
+from .langsets import LANGUAGES_WITHOUT_SPACES as _NO_SPACE
+
 # Closed-class tokens (articles/preps/aux/conj) that must NOT end a line —
 # ending here strands the token from the word it modifies.
 _FORBIDDEN_LEFT = {
@@ -106,9 +108,8 @@ def legal_break_index(tokens: list[str], lang: str, target: int) -> int:
     return target
 
 
-# Mirrors smart_split.LANGUAGES_WITHOUT_SPACES (kept in sync by hand to avoid a circular
-# import). yue is intentionally absent — smart_split treats yue as space-delimited.
-_NO_SPACE = {"zh", "ja", "th", "lo", "my"}
+# _NO_SPACE is the shared LANGUAGES_WITHOUT_SPACES (imported above). yue is intentionally absent
+# — smart_split treats yue as space-delimited.
 
 
 @functools.lru_cache(maxsize=8)

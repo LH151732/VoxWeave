@@ -133,11 +133,6 @@ def error_panel(exc: Exception) -> None:
     console.print(Panel(body, title="Error", border_style="red"))
 
 
-def info_panel(message: str, *, title: str, style: str = "yellow") -> None:
-    """Render a generic informational panel."""
-    console.print(Panel(message, title=title, border_style=style))
-
-
 def summary_panel(
     vtt_path: Path,
     *,
@@ -146,10 +141,13 @@ def summary_panel(
     normalized: bool = False,
 ) -> None:
     """Print transcription success panel: paths, language, cue count, and flags."""
+    from voxweave.pipeline import _swap_ext
+
     vtt = Path(vtt_path)
-    lines = [f"VTT  : {vtt}", f"JSON : {vtt.with_suffix('.json')}"]
+    json_path = _swap_ext(vtt, ".json")  # sibling derivation: never Path.with_suffix
+    lines = [f"VTT  : {vtt}", f"JSON : {json_path}"]
     try:
-        data = json.loads(vtt.with_suffix(".json").read_text(encoding="utf-8"))
+        data = json.loads(json_path.read_text(encoding="utf-8"))
         lines.append(f"lang : {data.get('language', '?')}")
         lines.append(f"cues : {len(data.get('segments', []))}")
     except (OSError, ValueError):

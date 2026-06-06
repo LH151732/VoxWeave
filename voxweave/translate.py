@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 
-from voxweave.realign import fmt_ts
+from voxweave.realign import render_cues
 
 log = logging.getLogger("voxweave")
 
@@ -50,21 +50,32 @@ def build_payload(blocks: list[dict]) -> list[dict]:
     ]
 
 
-def parse_response(raw: str | dict) -> dict[int, str]:
-    """Structured model output -> {index: translated text}; salvages the first complete JSON object from dirty text, returns {} on failure."""
-    obj = raw
-    if isinstance(raw, str):
+def _loads_salvage(raw: object) -> dict:
+    """Decode a model response to a dict, salvaging the first complete JSON object from dirty
+    text (markdown fences / prose preamble). Returns {} when nothing parseable is found.
+
+    Shared by parse_response (translations) and asrfix.parse_fixes (fixes).
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}  # non-str/non-dict (e.g. None): tolerate like the original inline parsers
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        if start < 0:
+            return {}
         try:
-            obj = json.loads(raw)
+            obj, _ = json.JSONDecoder().raw_decode(raw[start:])
         except json.JSONDecodeError:
-            start = raw.find("{")
-            if start < 0:
-                return {}
-            try:
-                obj, _ = json.JSONDecoder().raw_decode(raw[start:])
-            except json.JSONDecodeError:
-                return {}
-    items = obj.get("translations", []) if isinstance(obj, dict) else []
+            return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def parse_response(raw: object) -> dict[int, str]:
+    """Structured model output -> {index: translated text}; salvages the first complete JSON object from dirty text, returns {} on failure."""
+    items = _loads_salvage(raw).get("translations", [])
     out: dict[int, str] = {}
     for it in items:
         try:
@@ -81,15 +92,15 @@ def validate_and_fill(blocks: list[dict], trans: dict[int, str]) -> list[int]:
 
 def render_translated_vtt(blocks: list[dict], trans: dict[int, str]) -> str:
     """Translated text + per-block timestamps -> VTT; missing translations fall back to the original text; blocks without timestamps produce plain-text cues."""
-    out = ["WEBVTT", ""]
-    for i, b in enumerate(blocks):
-        text = trans.get(i, "").strip() or b["text"]
-        text = strip_punct_for_subtitles(text)
-        if b.get("start") is not None and b.get("end") is not None:
-            out.append(f"{fmt_ts(b['start'])} --> {fmt_ts(b['end'])}")
-        out.append(text)
-        out.append("")
-    return "\n".join(out).rstrip() + "\n"
+    rows = [
+        (
+            b.get("start"),
+            b.get("end"),
+            strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]),
+        )
+        for i, b in enumerate(blocks)
+    ]
+    return render_cues(rows)
 
 
 def format_glossary(glossary: dict[str, str] | str | None) -> str:

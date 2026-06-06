@@ -159,30 +159,6 @@ _CTC_STRIDE = 320  # wav2vec2 @16k downsamples 320x -> 50fps (20ms/frame)
 # Single global forced-align DP is O(T*L); cap audio length so it stays in memory. Movies past
 # this need DP-chunking at silence anchors (not yet wired). Default ~30min (50fps * 60 * 30).
 CTC_MAX_DP_FRAMES = int(os.environ.get("VOXWEAVE_CTC_MAX_DP_FRAMES", "90000"))
-# ISO-639-1 -> ISO-639-3 for uroman/ctc-forced-aligner.
-# zh maps to "chi" not "zho": preprocess_text checks for "chi" to enable per-character mode.
-_ISO1_TO_ISO3 = {
-    "en": "eng",
-    "zh": "chi",
-    "ja": "jpn",
-    "ko": "kor",
-    "yue": "chi",
-    "es": "spa",
-    "fr": "fra",
-    "de": "deu",
-    "it": "ita",
-    "pt": "por",
-    "ru": "rus",
-    "ar": "ara",
-    "hi": "hin",
-    "nl": "nld",
-    "tr": "tur",
-    "vi": "vie",
-    "th": "tha",
-    "id": "ind",
-    "uk": "ukr",
-    "pl": "pol",
-}
 
 _MISSING_HINT = (
     "Local model loading requires voxweave[qwen] (qwen-asr + einops/rotary-embedding-torch/...) + torch. "
@@ -460,10 +436,10 @@ def _asr_only(
     align_lang pre-computed here; falls back to 'en' for empty text (skipped in pass two anyway).
     """
     if engine == "whisper":
-        from voxweave.lang import is_supported, to_iso
+        from voxweave.lang import to_iso_or
 
         model = _get_whisper(model_id)
-        lang_iso = to_iso(language) if language and is_supported(language) else None
+        lang_iso = to_iso_or(language, None)
         if (
             lang_iso == "yue"
         ):  # whisper has no Cantonese code; alignment still uses yue downstream
@@ -542,12 +518,12 @@ def _fuse_chunk(
     det_w, text_w, units_w = w_res
     if not text_w.strip():
         return q_res
-    from voxweave.lang import is_supported, to_iso
+    from voxweave.lang import to_iso_or
     from voxweave.realign import NO_SPACE_LANGS, fuse_punct_into_text, reinject_punct
 
     det_q, text_q, units_q = q_res
     cand = language or det_w or det_q or "en"
-    iso = to_iso(cand) if is_supported(cand) else "en"
+    iso = to_iso_or(cand, "en")
     qwen_punct = reinject_punct(
         text_q, units_q, iso
     )  # Qwen units carry punctuation positions
@@ -999,6 +975,28 @@ def _ctc_align_logp(al, logp, toks, meta, words, nospace, total_samples):
     return units
 
 
+def _load_mono(wav_path: Path, target_sr: int, *, as_numpy: bool = False):
+    """Read audio as mono float32 at target_sr. Returns a torch tensor (default) or numpy (as_numpy).
+
+    Shared by the CTC aligners (torch tensor at al.sr) and MMS (_read_wav_16k, numpy at 16k);
+    keeps the read+downmix+conditional-resample sequence in one place.
+    """
+    import soundfile as sf
+    import torch
+    import torchaudio.functional as AF
+
+    data, fsr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+    mono = data.mean(axis=1)  # mono 1D (numpy)
+    if as_numpy:
+        if fsr != target_sr:
+            mono = AF.resample(torch.from_numpy(mono), fsr, target_sr).numpy()
+        return mono
+    wav = torch.from_numpy(mono)
+    if fsr != target_sr:
+        wav = AF.resample(wav, fsr, target_sr)
+    return wav
+
+
 def align_blocks_full_ctc(
     wav_path: Path, texts: list[str], iso: str, model_name: str
 ) -> list[list[dict]]:
@@ -1014,10 +1012,6 @@ def align_blocks_full_ctc(
     so audio past CTC_MAX_DP_FRAMES is rejected (movie-length needs silence-anchored DP-chunking,
     not yet wired). Units are absolute timestamps relative to the full wav.
     """
-    import soundfile as sf
-    import torch
-    import torchaudio.functional as AF
-
     from voxweave.realign import NO_SPACE_LANGS
 
     al = _get_ctc_aligner(iso, model_name)
@@ -1056,10 +1050,7 @@ def align_blocks_full_ctc(
     if not words:
         return [[] for _ in texts]
 
-    data, fsr = sf.read(str(wav_path), dtype="float32", always_2d=True)
-    wav = torch.from_numpy(data.mean(axis=1))  # mono 1D
-    if fsr != al.sr:
-        wav = AF.resample(wav, fsr, al.sr)
+    wav = _load_mono(wav_path, al.sr)
     frames = wav.shape[-1] / _CTC_STRIDE
     if frames > CTC_MAX_DP_FRAMES:
         raise RuntimeError(
@@ -1082,10 +1073,6 @@ def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list
     Forward pass branches on al.kind for torchaudio bundle vs HF Wav2Vec2.
     Exceptions propagate; align_text catches and falls back to Qwen.
     """
-    import soundfile as sf
-    import torch
-    import torchaudio.functional as AF
-
     from voxweave.realign import NO_SPACE_LANGS
 
     text = (text or "").strip()
@@ -1100,21 +1087,11 @@ def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list
     if not words or all(m < 0 for m in meta):
         return []
 
-    data, fsr = sf.read(str(wav_path), dtype="float32", always_2d=True)
-    wav = torch.from_numpy(data.mean(axis=1))  # mono 1D
-    if fsr != al.sr:
-        wav = AF.resample(wav, fsr, al.sr)
-
+    wav = _load_mono(wav_path, al.sr)
     logp = _ctc_logp(al, wav)
     units = _ctc_align_logp(al, logp, toks, meta, words, nospace, wav.shape[-1])
     _empty_cache()
     return units
-
-
-def _to_iso3(iso: str) -> str:
-    """ISO-639-1 -> ISO-639-3 for uroman/ctc-forced-aligner. Unknown codes pass through unchanged."""
-    code = (iso or "").lower()
-    return _ISO1_TO_ISO3.get(code, code)
 
 
 def _resolve_mms_onnx() -> str:
@@ -1152,23 +1129,19 @@ def _get_mms_aligner() -> CtcMms:
     return _mms
 
 
+def _is_mms_name(model_name: str | None) -> bool:
+    """True if an [align] alias routes to MMS (align_text_mms) instead of wav2vec2."""
+    return bool(model_name) and model_name.strip().lower() in _MMS_NAMES
+
+
 def uses_mms(iso: str) -> bool:
     """True if the configured aligner for this iso routes to MMS (mms/ctc alias)."""
-    m = config.align_model_for(iso)
-    return bool(m) and m.strip().lower() in _MMS_NAMES
+    return _is_mms_name(config.align_model_for(iso))
 
 
 def _read_wav_16k(wav_path: Path):
     """Read audio as 16k mono float32 numpy array (MMS_SR=16k required by ctc-forced-aligner)."""
-    import soundfile as sf
-    import torch
-    import torchaudio.functional as AF
-
-    data, fsr = sf.read(str(wav_path), dtype="float32", always_2d=True)
-    wav = data.mean(axis=1)  # mono 1D
-    if fsr != MMS_SR:
-        wav = AF.resample(torch.from_numpy(wav), fsr, MMS_SR).numpy()
-    return wav
+    return _load_mono(wav_path, MMS_SR, as_numpy=True)
 
 
 def _mms_emit_units(wav, text: str, iso: str) -> list[dict]:
@@ -1187,6 +1160,7 @@ def _mms_emit_units(wav, text: str, iso: str) -> list[dict]:
         preprocess_text,
     )
 
+    from voxweave.lang import to_iso3
     from voxweave.realign import NO_SPACE_LANGS
 
     text = (text or "").strip()
@@ -1195,7 +1169,7 @@ def _mms_emit_units(wav, text: str, iso: str) -> list[dict]:
     if wav.shape[0] < 400:  # generate_emissions minimum input length
         wav = np.pad(wav, (0, 400 - wav.shape[0]))
     mm = _get_mms_aligner()
-    iso3 = _to_iso3(iso)
+    iso3 = to_iso3(iso)
     emissions, stride = generate_emissions(
         mm.session, wav.astype(np.float32), batch_size=MMS_BATCH
     )
@@ -1296,7 +1270,7 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
         model_name = config.align_model_for(iso)
         if model_name:
             try:
-                if model_name.strip().lower() in _MMS_NAMES:
+                if _is_mms_name(model_name):
                     return align_text_mms(wav_path, text, iso)
                 return align_text_ctc(wav_path, text, iso, model_name)
             except Exception as e:  # noqa: BLE001 -- any CTC failure falls back to Qwen
@@ -1334,12 +1308,10 @@ def _release_qwen_asr() -> None:
 
 def release() -> None:
     """Release all ASR/alignment singletons. Call after end of transcription or alignment episode."""
-    global _asr, _asr_id, _aligner, _whisper, _whisper_id, _ctc, _ctc_lang, _mms
-    _asr = None
-    _asr_id = None
+    global _aligner, _ctc, _ctc_lang, _mms
+    _release_qwen_asr()
+    _release_whisper()
     _aligner = None
-    _whisper = None
-    _whisper_id = None
     _ctc = None
     _ctc_lang = None
     _mms = None

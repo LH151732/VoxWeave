@@ -139,11 +139,13 @@ def test_align_text_missing_models_raises_friendly(tmp_path):
 
 def test_to_iso3_mapping():
     # ctc-forced-aligner / uroman uses ISO-639-3; zh->chi (library checks ["jpn","chi"] to force per-char mode)
-    assert backend._to_iso3("ja") == "jpn"
-    assert backend._to_iso3("zh") == "chi"
-    assert backend._to_iso3("en") == "eng"
+    from voxweave import lang
+
+    assert lang.to_iso3("ja") == "jpn"
+    assert lang.to_iso3("zh") == "chi"
+    assert lang.to_iso3("en") == "eng"
     assert (
-        backend._to_iso3("xyz") == "xyz"
+        lang.to_iso3("xyz") == "xyz"
     )  # no mapping (already 3-letter) -> pass through unchanged
 
 
@@ -253,7 +255,11 @@ def test_resolve_separator_downloads_missing_ckpt(monkeypatch, tmp_path):
     assert rck == cached and rcf == cf
     # separator weights download into the voxweave audio cache subdir
     assert calls == [
-        (backend.SEPARATOR_REPO, backend.SEPARATOR_REPO_FILE, backend.config.AUDIO_CACHE)
+        (
+            backend.SEPARATOR_REPO,
+            backend.SEPARATOR_REPO_FILE,
+            backend.config.AUDIO_CACHE,
+        )
     ]
 
 

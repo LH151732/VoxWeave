@@ -17,6 +17,65 @@ from voxweave.ui import (
 )
 
 
+def _run(fn, *, reporter: bool = True):
+    """Run a pipeline call, rendering a unified error panel and exiting 1 on any failure.
+
+    ``fn`` receives a :class:`RichReporter` (or ``None`` when ``reporter=False``). Centralises
+    the try/RichReporter/except wrapper shared by every subcommand.
+    """
+    try:
+        if reporter:
+            with RichReporter() as rep:
+                return fn(rep)
+        return fn(None)
+    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
+        error_panel(exc)
+        sys.exit(1)
+
+
+def llm_options(model_envvar: str, model_help: str):
+    """Stack the shared --model/--base-url/--api-key-env options for the LLM subcommands."""
+
+    def decorator(fn):
+        fn = click.option(
+            "--api-key-env",
+            default="OPENAI_API_KEY",
+            help="Environment variable to read the API key from (default: OPENAI_API_KEY).",
+        )(fn)
+        fn = click.option(
+            "--base-url",
+            default=None,
+            envvar="OPENAI_BASE_URL",
+            help="OpenAI-compatible endpoint URL.",
+        )(fn)
+        fn = click.option(
+            "--model", default=None, envvar=model_envvar, help=model_help
+        )(fn)
+        return fn
+
+    return decorator
+
+
+def _resolve_llm(
+    api_key_env: str, model: str | None, base_url: str | None
+) -> tuple[str, dict]:
+    """Resolve the API key (panel + exit 1 if unset) and build the model/base_url kwargs dict."""
+    api_key = os.environ.get(api_key_env)
+    if not api_key:
+        error_panel(
+            RuntimeError(
+                f"API key not found: set env {api_key_env} (or use --api-key-env to specify another variable)"
+            )
+        )
+        sys.exit(1)
+    kwargs: dict = {}
+    if model:
+        kwargs["model"] = model
+    if base_url:
+        kwargs["base_url"] = base_url
+    return api_key, kwargs
+
+
 class DefaultGroup(click.Group):
     """`voxweave <media>` runs transcription without an explicit subcommand.
 
@@ -153,23 +212,20 @@ def cmd_transcribe(
     timestamps: bool,
 ) -> None:
     """Media -> (vocal separation) -> VAD -> local ASR/alignment -> smart_split -> write VTT+JSON."""
-    try:
-        with RichReporter() as rep:
-            out = pipeline.process(
-                media,
-                lang_override=language,
-                separate=separate,
-                reporter=rep,
-                debug=debug,
-                normalize=normalize,
-                skip_songs=skip_songs,
-                asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
-                context=context,
-                timestamps=timestamps,
-            )
-    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
-        error_panel(exc)
-        sys.exit(1)
+    out = _run(
+        lambda rep: pipeline.process(
+            media,
+            lang_override=language,
+            separate=separate,
+            reporter=rep,
+            debug=debug,
+            normalize=normalize,
+            skip_songs=skip_songs,
+            asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
+            context=context,
+            timestamps=timestamps,
+        )
+    )
     dbg_dir = Path("debug") / media.stem if debug else None
     summary_panel(
         out,
@@ -212,11 +268,10 @@ def cmd_split(
         kwargs["max_line_length"] = max_line_length
     if max_lines is not None:
         kwargs["max_lines"] = max_lines
-    try:
-        out = pipeline.split(json_path, timestamps=timestamps, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - top-level catch-all
-        error_panel(exc)
-        sys.exit(1)
+    out = _run(
+        lambda _rep: pipeline.split(json_path, timestamps=timestamps, **kwargs),
+        reporter=False,
+    )
     click.echo(out)
 
 
@@ -257,19 +312,16 @@ def cmd_align(
 
     **Loads alignment/separation models locally** (in-process PyTorch, see voxweave.backend); no endpoint calls.
     """
-    try:
-        with RichReporter() as rep:
-            out = pipeline.align(
-                vtt,
-                media_path=media,
-                separate=separate,
-                normalize=normalize,
-                lang_override=language,
-                reporter=rep,
-            )
-    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
-        error_panel(exc)
-        sys.exit(1)
+    out = _run(
+        lambda rep: pipeline.align(
+            vtt,
+            media_path=media,
+            separate=separate,
+            normalize=normalize,
+            lang_override=language,
+            reporter=rep,
+        )
+    )
     summary_panel(out, separated=separate, normalized=normalize)
     click.echo(out)
 
@@ -290,22 +342,9 @@ def cmd_align(
     default=None,
     help="Term/name glossary (.json -> mapping dict; any other format -> passed as raw text prompt).",
 )
-@click.option(
-    "--model",
-    default=None,
-    envvar="VOXWEAVE_TRANSLATE_MODEL",
-    help="Translation model (default: VOXWEAVE_TRANSLATE_MODEL env or gpt-5.3-chat-latest).",
-)
-@click.option(
-    "--base-url",
-    default=None,
-    envvar="OPENAI_BASE_URL",
-    help="OpenAI-compatible endpoint URL.",
-)
-@click.option(
-    "--api-key-env",
-    default="OPENAI_API_KEY",
-    help="Environment variable to read the API key from (default: OPENAI_API_KEY).",
+@llm_options(
+    "VOXWEAVE_TRANSLATE_MODEL",
+    "Translation model (default: VOXWEAVE_TRANSLATE_MODEL env or gpt-5.3-chat-latest).",
 )
 def cmd_translate(
     vtt: Path,
@@ -320,33 +359,18 @@ def cmd_translate(
     from voxweave.translate import load_glossary
 
     gloss = load_glossary(glossary) if glossary else None
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
-        error_panel(
-            RuntimeError(
-                f"API key not found: set env {api_key_env} (or use --api-key-env to specify another variable)"
-            )
+    api_key, kwargs = _resolve_llm(api_key_env, model, base_url)
+    out = _run(
+        lambda rep: pipeline.translate(
+            vtt,
+            to=to,
+            context=context,
+            glossary=gloss,
+            api_key=api_key,
+            reporter=rep,
+            **kwargs,
         )
-        sys.exit(1)
-    kwargs: dict = {}
-    if model:
-        kwargs["model"] = model
-    if base_url:
-        kwargs["base_url"] = base_url
-    try:
-        with RichReporter() as rep:
-            out = pipeline.translate(
-                vtt,
-                to=to,
-                context=context,
-                glossary=gloss,
-                api_key=api_key,
-                reporter=rep,
-                **kwargs,
-            )
-    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
-        error_panel(exc)
-        sys.exit(1)
+    )
     translate_summary_panel(out, to=to)
     click.echo(out)
 
@@ -377,22 +401,9 @@ def cmd_translate(
     default=None,
     help="Source media for the auto re-align (default: sibling file with the same stem).",
 )
-@click.option(
-    "--model",
-    default=None,
-    envvar="VOXWEAVE_FIX_MODEL",
-    help="Correction model (default: VOXWEAVE_FIX_MODEL env or gpt-5.3-chat-latest).",
-)
-@click.option(
-    "--base-url",
-    default=None,
-    envvar="OPENAI_BASE_URL",
-    help="OpenAI-compatible endpoint URL.",
-)
-@click.option(
-    "--api-key-env",
-    default="OPENAI_API_KEY",
-    help="Environment variable to read the API key from (default: OPENAI_API_KEY).",
+@llm_options(
+    "VOXWEAVE_FIX_MODEL",
+    "Correction model (default: VOXWEAVE_FIX_MODEL env or gpt-5.3-chat-latest).",
 )
 def cmd_correct(
     vtt: Path,
@@ -414,33 +425,18 @@ def cmd_correct(
     from voxweave.translate import load_glossary
 
     gloss = load_glossary(glossary) if glossary else None
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
-        error_panel(
-            RuntimeError(
-                f"API key not found: set env {api_key_env} (or use --api-key-env to specify another variable)"
-            )
+    api_key, kwargs = _resolve_llm(api_key_env, model, base_url)
+    res = _run(
+        lambda rep: pipeline.correct(
+            vtt,
+            glossary=gloss,
+            api_key=api_key,
+            apply=apply,
+            align_after=apply and do_align,
+            media_path=media,
+            reporter=rep,
+            **kwargs,
         )
-        sys.exit(1)
-    kwargs: dict = {}
-    if model:
-        kwargs["model"] = model
-    if base_url:
-        kwargs["base_url"] = base_url
-    try:
-        with RichReporter() as rep:
-            res = pipeline.correct(
-                vtt,
-                glossary=gloss,
-                api_key=api_key,
-                apply=apply,
-                align_after=apply and do_align,
-                media_path=media,
-                reporter=rep,
-                **kwargs,
-            )
-    except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
-        error_panel(exc)
-        sys.exit(1)
+    )
     correct_summary_panel(res)
     click.echo(res["out"])

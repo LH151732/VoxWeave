@@ -139,19 +139,21 @@ def ensure_default_config() -> None:
         log.warning("could not create default config %s (%r), ignoring", p, e)
 
 
+def _nonempty_str(v: object) -> str | None:
+    """Return v if it is a non-blank string, else None (config values may be missing/blank/non-str)."""
+    return v if isinstance(v, str) and v.strip() else None
+
+
 def conf_asr_model() -> str | None:
     """ASR model from config; None if unset (caller falls back to env/built-in)."""
-    v = _load().get("asr_model")
-    return v if isinstance(v, str) and v.strip() else None
+    return _nonempty_str(_load().get("asr_model"))
 
 
 def _conf_fusion(key: str) -> str | None:
     """``[fusion].<key>`` from config, or None if absent/empty."""
     fusion = _load().get("fusion")
     if isinstance(fusion, dict):
-        v = fusion.get(key)
-        if isinstance(v, str) and v.strip():
-            return v
+        return _nonempty_str(fusion.get(key))
     return None
 
 
@@ -159,14 +161,14 @@ def conf_fusion_whisper() -> str:
     """Fusion whisper sub-model (faster-whisper size string).
     Precedence: env VOXWEAVE_FUSION_WHISPER > conf [fusion].whisper > default."""
     v = os.environ.get("VOXWEAVE_FUSION_WHISPER") or _conf_fusion("whisper")
-    return v if isinstance(v, str) and v.strip() else DEFAULT_FUSION_WHISPER
+    return _nonempty_str(v) or DEFAULT_FUSION_WHISPER
 
 
 def conf_fusion_qwen() -> str:
     """Fusion Qwen punctuation sub-model (must be 1.7B — 0.6B emits no punctuation).
     Precedence: env VOXWEAVE_FUSION_QWEN > conf [fusion].qwen > default."""
     v = os.environ.get("VOXWEAVE_FUSION_QWEN") or _conf_fusion("qwen")
-    return v if isinstance(v, str) and v.strip() else DEFAULT_FUSION_QWEN
+    return _nonempty_str(v) or DEFAULT_FUSION_QWEN
 
 
 _LOAD_STRATEGIES = ("peak", "sum")
@@ -196,8 +198,7 @@ def align_model_for(iso: str) -> str | None:
     """
     align = _load().get("align")
     if isinstance(align, dict) and iso in align:
-        v = align[iso]
-        return v if isinstance(v, str) and v.strip() else None
+        return _nonempty_str(align[iso])
     return DEFAULT_ALIGN_MODELS.get(iso)
 
 

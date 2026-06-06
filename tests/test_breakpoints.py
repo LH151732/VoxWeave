@@ -82,7 +82,7 @@ def test_phrase_atoms_ja_real_grouping():
 
 
 def test_no_space_sets_in_sync():
-    # _NO_SPACE must be kept manually in sync with smart_split.LANGUAGES_WITHOUT_SPACES (prevent drift)
+    # Both now alias the canonical core.langsets.LANGUAGES_WITHOUT_SPACES; this guards the re-exports.
     from voxweave.core.breakpoints import _NO_SPACE
     from voxweave.core.smart_split import LANGUAGES_WITHOUT_SPACES
 
