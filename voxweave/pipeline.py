@@ -16,7 +16,7 @@ from voxweave.chunking import (
     vad_speech_segments,
 )
 from voxweave.debug import DebugSink, FileDebugSink
-from voxweave.lang import is_supported, to_iso
+from voxweave.lang import is_supported, to_iso_or
 from voxweave.progress import Reporter
 from voxweave import realign
 from voxweave import translate as translate_mod
@@ -144,6 +144,55 @@ def _find_sibling_media(ref: Path) -> Path | None:
     return None
 
 
+def _separate_to_16k_32k(
+    media: Path, *, reporter: Reporter, normalize: bool
+) -> tuple[Path, Path, Path, Path]:
+    """Decode full-band 44.1k stereo -> Roformer separate -> resample, returning
+    ``(fullband, vocals, wav_16k, voc32_32k)``.
+
+    The full-band 44.1k stereo feed is a hard constraint (Roformer is trained at 44.1k);
+    downsampling to 16k/32k happens only after separation. Callers own temp bookkeeping,
+    debug dumps, and caching of the returned paths.
+
+    On a clean return the caller registers the paths in its own ``tmp`` list (cleaned in its
+    ``finally``). Since that registration only runs after this returns, the helper self-cleans
+    its partial outputs if a later step raises — otherwise an OOM/ffmpeg failure mid-separation
+    would orphan the already-decoded temp files.
+    """
+    af = ASR_LOUDNORM if normalize else None
+    created: list[Path] = []
+    try:
+        reporter.stage("decode fullband 44.1k")
+        fullband = decode_to_wav(media, sample_rate=44100, mono=False)
+        created.append(fullband)
+        reporter.stage("vocal separation (Roformer)")
+        vocals = backend.separate_vocals(
+            fullband,
+            progress=_progress_bridge(reporter, "vocal separation (Roformer)"),
+        )
+        created.append(vocals)
+        reporter.stage("resample 16k")
+        wav = decode_to_wav(vocals, audio_filter=af)
+        created.append(wav)
+        voc32 = decode_to_wav(
+            vocals, sample_rate=SONGDET_SR
+        )  # 32k mono: PANNs + cache source
+        return fullband, vocals, wav, voc32
+    except Exception:
+        for p in created:
+            p.unlink(missing_ok=True)
+        raise
+
+
+def _load_cues(vtt_path: Path) -> list[dict]:
+    """Parse VTT cue blocks; raise if the file has no cues. Shared guard for align/translate/correct."""
+    vtt_path = Path(vtt_path)
+    blocks = realign.parse_vtt_blocks(vtt_path.read_text(encoding="utf-8"))
+    if not blocks:
+        raise RuntimeError(f"no cues in {vtt_path.name}")
+    return blocks
+
+
 def plan_song_skip(
     song_spans: list[tuple[float, float]],
     sing_spans: list[tuple[float, float]],
@@ -214,20 +263,13 @@ def transcribe(
                 voc32 = Path(cache_vocals)
                 wav = decode_to_wav(voc32, audio_filter=af)  # 32k flac -> 16k mono
             else:
-                rep.stage("decode fullband 44.1k")
-                fullband = decode_to_wav(media_path, sample_rate=44100, mono=False)
+                fullband, vocals, wav, voc32 = _separate_to_16k_32k(
+                    media_path, reporter=rep, normalize=normalize
+                )
                 tmp.append(fullband)
                 dbg.audio("00_fullband_44k.wav", fullband)
-                rep.stage("vocal separation (Roformer)")
-                vocals = backend.separate_vocals(
-                    fullband,
-                    progress=_progress_bridge(rep, "vocal separation (Roformer)"),
-                )
                 tmp.append(vocals)
                 dbg.audio("01_vocals.flac", vocals)
-                rep.stage("resample 16k")
-                wav = decode_to_wav(vocals, audio_filter=af)
-                voc32 = decode_to_wav(vocals, sample_rate=SONGDET_SR)
                 tmp.append(voc32)
                 log.info("separated vocals (local Roformer)")
                 if cache_vocals is not None:
@@ -376,7 +418,7 @@ def transcribe(
             log.warning(
                 "language %r not in aligner set; smart_split may misbehave", lang_name
             )
-        iso = to_iso(lang_name) if is_supported(lang_name) else "en"
+        iso = to_iso_or(lang_name, "en")
 
         # Aligner strips punctuation; reinject_punct reattaches it by time so smart_split
         # can use it for sentence breaking and space insertion.
@@ -427,6 +469,32 @@ def transcribe(
             c.unlink(missing_ok=True)
 
 
+def _spans_in(raw: Any) -> list[tuple[float, float]] | None:
+    """Parse a persisted ``vad_speech`` array (``[[start, end], ...]``) to float tuples; None if absent/empty."""
+    return [(float(s), float(e)) for s, e in raw] if raw else None
+
+
+def _dump_sibling_json(
+    json_path: Path,
+    *,
+    language: str,
+    segments: list[dict],
+    units: list[dict],
+    vad_speech: list[tuple[float, float]] | None,
+) -> None:
+    """Write the sibling JSON document (language + segments + word_segments + optional vad_speech).
+
+    ``vad_speech=None`` omits the key; a list (even empty) writes it coerced to ``[[float, float], ...]``.
+    Single source of truth for the sibling-JSON shape shared by process and align.
+    """
+    data: dict = {"language": language, "segments": segments, "word_segments": units}
+    if vad_speech is not None:
+        data["vad_speech"] = [[float(s), float(e)] for s, e in vad_speech]
+    json_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 def _write_siblings(
     src: Path,
     cues: list[dict],
@@ -443,23 +511,23 @@ def _write_siblings(
     ``realign.parse_vtt_blocks``. Uses ``_swap_ext`` (not ``with_suffix``) to preserve
     interior dots in filenames.
     """
-    data = {
-        "language": lang,
-        "segments": cues,
-        "word_segments": units,
-        "vad_speech": [[float(s), float(e)] for s, e in (vad_speech or [])],
-    }
-    _swap_ext(src, ".json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    _dump_sibling_json(
+        _swap_ext(src, ".json"),
+        language=lang,
+        segments=cues,
+        units=units,
+        vad_speech=vad_speech or [],
     )
-    lines = ["WEBVTT", ""]
-    for c in cues:
-        if timestamps and c.get("start") is not None and c.get("end") is not None:
-            lines.append(f"{realign.fmt_ts(c['start'])} --> {realign.fmt_ts(c['end'])}")
-        lines.append(c["text"])
-        lines.append("")
+    rows = [
+        (
+            c.get("start") if timestamps else None,
+            c.get("end") if timestamps else None,
+            c["text"],
+        )
+        for c in cues
+    ]
     vtt_path = _swap_ext(src, ".vtt")
-    vtt_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    vtt_path.write_text(realign.render_cues(rows), encoding="utf-8")
     return vtt_path
 
 
@@ -548,8 +616,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     data = json.loads(json_path.read_text(encoding="utf-8"))
     units = data["word_segments"]
     iso = data.get("language", "en")
-    vad = data.get("vad_speech")
-    speech_spans = [(float(s), float(e)) for s, e in vad] if vad else None
+    speech_spans = _spans_in(data.get("vad_speech"))
     units = realign.snap_break_punct(
         units, iso
     )  # zh: snap to jieba boundary (same as process)
@@ -594,21 +661,10 @@ def _prepare_16k_for_align(
             reporter.stage("vocals cache (16k legacy)")
             log.info("reuse legacy 16k vocals %s", legacy)
             return legacy
-        reporter.stage("decode fullband 44.1k")
-        fullband = decode_to_wav(media, sample_rate=44100, mono=False)
-        tmp.append(fullband)
-        reporter.stage("vocal separation (Roformer)")
-        vocals = backend.separate_vocals(
-            fullband, progress=_progress_bridge(reporter, "vocal separation (Roformer)")
+        fullband, vocals, wav, voc32 = _separate_to_16k_32k(
+            media, reporter=reporter, normalize=normalize
         )
-        tmp.append(vocals)
-        reporter.stage("resample 16k")
-        wav = decode_to_wav(vocals, audio_filter=af)
-        tmp.append(wav)
-        voc32 = decode_to_wav(
-            vocals, sample_rate=SONGDET_SR
-        )  # 32k canonical cache source
-        tmp.append(voc32)
+        tmp.extend((fullband, vocals, wav, voc32))
         try:
             _encode_flac(voc32, cache)
             log.info("cached vocals 32k → %s", cache)
@@ -635,12 +691,61 @@ def _write_align_json(
     segments = [
         {"text": b["text"], "start": a, "end": e} for b, (a, e) in zip(blocks, spans)
     ]
-    data: dict = {"language": lang, "segments": segments, "word_segments": units}
-    if vad_speech is not None:
-        data["vad_speech"] = [[float(s), float(e)] for s, e in vad_speech]
-    json_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    _dump_sibling_json(
+        json_path,
+        language=lang,
+        segments=segments,
+        units=units,
+        vad_speech=vad_speech,
     )
+
+
+def _align_blocks(
+    wav: Path,
+    blocks: list[dict],
+    iso: str,
+    *,
+    mms: bool,
+    ctc_model: str | None,
+    crops: list[tuple[float, float] | None],
+    reporter: Reporter,
+    tmp_chunks: list[Path],
+) -> list[list[dict]]:
+    """Route blocks to the configured aligner and return per-block units.
+
+    Three paths — these ARE the hard-constraint full-pass routing; do NOT collapse them:
+    - ja MMS: one full-file pass (``align_blocks_full_mms``).
+    - en wav2vec2 CTC: one full-file windowed-emission pass (``align_blocks_full_ctc``).
+    - zh·yue (no CTC config): per-cue tight-crop Qwen — each cue gets its own audio slice so
+      error is contained within the sentence and inter-sentence pauses are preserved.
+
+    Per-cue slices are appended to ``tmp_chunks`` for the caller's ``finally`` to clean up.
+    """
+    if mms:
+        reporter.task("full-file alignment (MMS)", 1)
+        units = backend.align_blocks_full_mms(wav, [b["text"] for b in blocks], iso)
+        reporter.advance(1)
+        return units
+    if ctc_model:  # en wav2vec2: windowed emission + single global DP
+        reporter.task("full-file alignment (CTC)", 1)
+        units = backend.align_blocks_full_ctc(
+            wav, [b["text"] for b in blocks], iso, ctc_model
+        )
+        reporter.advance(1)
+        return units
+    reporter.task("per-cue alignment", len(blocks))
+    block_units: list[list[dict]] = [[] for _ in blocks]
+    for i, crop in enumerate(crops):
+        text = realign.join_block_texts([blocks[i]["text"]], iso)
+        if crop is None or not text:  # insertion block or empty: skip
+            reporter.advance(1)
+            continue
+        cs, ce = crop
+        cwav = slice_wav(wav, cs, ce)
+        tmp_chunks.append(cwav)
+        block_units[i] = shift_units(backend.align_text(cwav, text, iso), cs)
+        reporter.advance(1)
+    return block_units
 
 
 def align(
@@ -666,12 +771,10 @@ def align(
     )
     word_segments = data.get("word_segments", [])
 
-    blocks = realign.parse_vtt_blocks(vtt_path.read_text(encoding="utf-8"))
-    if not blocks:
-        raise RuntimeError(f"no cues in {vtt_path.name}")
+    blocks = _load_cues(vtt_path)
 
     lang_name = lang_override or data.get("language") or "english"
-    iso = to_iso(lang_name) if is_supported(lang_name) else "en"
+    iso = to_iso_or(lang_name, "en")
 
     media = Path(media_path) if media_path else _find_sibling_media(vtt_path)
     if media is None or not media.exists():
@@ -721,33 +824,16 @@ def align(
             reporter=rep,
             tmp=tmp,
         )
-        if mms:
-            rep.task("full-file alignment (MMS)", 1)
-            block_units = backend.align_blocks_full_mms(
-                wav, [b["text"] for b in blocks], iso
-            )
-            rep.advance(1)
-        elif ctc_model:  # en wav2vec2: windowed emission + single global DP
-            rep.task("full-file alignment (CTC)", 1)
-            block_units = backend.align_blocks_full_ctc(
-                wav, [b["text"] for b in blocks], iso, ctc_model
-            )
-            rep.advance(1)
-        else:
-            # Per-cue tight-crop Qwen alignment (zh·yue): each cue gets its own audio slice;
-            # error is contained within the sentence and inter-sentence pauses are preserved.
-            rep.task("per-cue alignment", len(blocks))
-            block_units = [[] for _ in blocks]
-            for i, crop in enumerate(crops):
-                text = realign.join_block_texts([blocks[i]["text"]], iso)
-                if crop is None or not text:  # insertion block or empty: skip
-                    rep.advance(1)
-                    continue
-                cs, ce = crop
-                cwav = slice_wav(wav, cs, ce)
-                tmp_chunks.append(cwav)
-                block_units[i] = shift_units(backend.align_text(cwav, text, iso), cs)
-                rep.advance(1)
+        block_units = _align_blocks(
+            wav,
+            blocks,
+            iso,
+            mms=mms,
+            ctc_model=ctc_model,
+            crops=crops,
+            reporter=rep,
+            tmp_chunks=tmp_chunks,
+        )
 
         # Tight cropping eliminates "last word drifts into inter-sentence silence", so
         # position_units_with_vad is not needed here (unlike the transcribe path).
@@ -770,10 +856,7 @@ def align(
         vtt_path.write_text(realign.render_vtt(blocks, spans_filled), encoding="utf-8")
         # Preserve vad_speech from the original JSON (computed by transcribe from original
         # audio; align does not recompute it).
-        persisted_vad = data.get("vad_speech")
-        keep_vad = (
-            [(float(s), float(e)) for s, e in persisted_vad] if persisted_vad else None
-        )
+        keep_vad = _spans_in(data.get("vad_speech"))
         _write_align_json(json_path, blocks, spans_filled, all_units, iso, keep_vad)
         log.info(
             "aligned %s → %d cues, %d units", vtt_path.name, len(blocks), len(all_units)
@@ -806,9 +889,7 @@ def translate(
     """
     vtt_path = Path(vtt_path)
     rep = reporter or Reporter()
-    blocks = realign.parse_vtt_blocks(vtt_path.read_text(encoding="utf-8"))
-    if not blocks:
-        raise RuntimeError(f"no cues in {vtt_path.name}")
+    blocks = _load_cues(vtt_path)
     if any(b.get("start") is None for b in blocks):
         log.warning(
             "%s has no timestamps; translated output will be plain-text blocks (run align first)",
@@ -878,9 +959,7 @@ def correct(
     """
     vtt_path = Path(vtt_path)
     rep = reporter or Reporter()
-    blocks = realign.parse_vtt_blocks(vtt_path.read_text(encoding="utf-8"))
-    if not blocks:
-        raise RuntimeError(f"no cues in {vtt_path.name}")
+    blocks = _load_cues(vtt_path)
 
     payload = asrfix_mod.build_payload(blocks)
     rep.stage(f"LLM correction {len(payload)} cues (model={model})")

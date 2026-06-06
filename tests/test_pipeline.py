@@ -6,7 +6,9 @@ silently truncated by ``Path.with_suffix`` when deriving .vtt/.json sibling path
 
 from pathlib import Path
 
-from voxweave import pipeline
+import pytest
+
+from voxweave import backend, pipeline
 
 # Real filename that triggered the bug: title has interior ``...``
 DOTTED = (
@@ -90,3 +92,29 @@ def test_find_sibling_media_matches_dotted_name(tmp_path):
     media.write_bytes(b"x")
     vtt = tmp_path / f"{DOTTED}.vtt"
     assert pipeline._find_sibling_media(vtt) == media
+
+
+def test_separate_self_cleans_partial_temps_on_failure(tmp_path, monkeypatch):
+    # Regression: _separate_to_16k_32k must unlink already-decoded temps if a later step raises.
+    # Callers register the returned paths in their `tmp` cleanup list only AFTER a clean return,
+    # so an OOM/ffmpeg failure mid-separation would otherwise orphan the fullband temp file.
+    created: list[Path] = []
+
+    def fake_decode(media, **kw):
+        p = tmp_path / f"f{len(created)}.wav"
+        p.write_bytes(b"x")
+        created.append(p)
+        return p
+
+    def boom(fullband, **kw):
+        raise RuntimeError("separation OOM")
+
+    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(backend, "separate_vocals", boom)
+
+    with pytest.raises(RuntimeError):
+        pipeline._separate_to_16k_32k(
+            tmp_path / "m.mkv", reporter=pipeline.Reporter(), normalize=False
+        )
+    # fullband was decoded before separation failed -> helper must have cleaned it up
+    assert created and not created[0].exists()
