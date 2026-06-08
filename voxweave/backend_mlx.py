@@ -41,10 +41,24 @@ _MISSING_MLX = (
     "Force the torch backend instead with VOXWEAVE_BACKEND=torch. Missing: {mod}"
 )
 
-# Process-level singletons; released by release()/release_asr() at end of episode (mirrors backend.py).
+# whisper size string -> mlx-community converted repo. The hybrid/fusion engines (--model large-v3,
+# --hybrid) need whisper text, but faster-whisper's ctranslate2 has no Metal backend; mlx-whisper is
+# the native Metal port. Sizes outside this table fall back to the generic mlx-community naming
+# `whisper-<size>-mlx` (covers tiny/base/small/medium/large-v3); turbo/distil deviate, so list them.
+_MLX_WHISPER_REPOS = {
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "distil-large-v3": "mlx-community/distil-whisper-large-v3",
+    "distil-large-v2": "mlx-community/distil-whisper-large-v2",
+}
+
+# Process-level singletons; released by release()/release_asr()/release_whisper() at end of episode
+# (mirrors backend.py).
 _asr = None  # _MlxAsr adapter
 _asr_repo = None  # currently loaded MLX ASR repo id (reloaded on --model change)
 _aligner = None  # mlx_audio forced-aligner model
+_whisper = None  # _MlxWhisper adapter
+_whisper_id = None  # currently loaded whisper size string (reloaded on --model change)
 
 
 def _require(mod: str) -> RuntimeError:
@@ -62,6 +76,16 @@ def _load(repo: str, cache_dir: str):
         raise _require(e.name or "mlx_audio") from e
     local = snapshot_download(repo, cache_dir=cache_dir)
     return load(local)
+
+
+def _snapshot(repo: str, cache_dir: str) -> str:
+    """Download repo into cache_dir and return the local snapshot dir (no mlx_audio.stt.load).
+    Used for the whisper path, which loads via mlx_whisper.transcribe(path_or_hf_repo=local_dir)."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ModuleNotFoundError as e:
+        raise _require(e.name or "huggingface_hub") from e
+    return snapshot_download(repo, cache_dir=cache_dir)
 
 
 def _clear_cache() -> None:
@@ -145,6 +169,102 @@ def get_asr(model_id: str | None = None):
     return _asr
 
 
+def _mlx_whisper_repo(size: str) -> str:
+    """Map a faster-whisper size string to the mlx-community converted repo.
+
+    VOXWEAVE_MLX_WHISPER_REPO hard-overrides (pin a specific quant/repo). Known sizes resolve via
+    the table; everything else uses the generic `mlx-community/whisper-<size>-mlx` convention.
+    """
+    override = os.environ.get("VOXWEAVE_MLX_WHISPER_REPO", "").strip()
+    if override:
+        return override
+    if size in _MLX_WHISPER_REPOS:
+        return _MLX_WHISPER_REPOS[size]
+    return f"mlx-community/whisper-{size}-mlx"
+
+
+class _WhisperSegment:
+    """Mirror of faster-whisper's Segment: backend._asr_only reads only `.text`."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+
+class _WhisperInfo:
+    """Mirror of faster-whisper's TranscriptionInfo: backend._asr_only reads only `.language`."""
+
+    __slots__ = ("language",)
+
+    def __init__(self, language: str | None):
+        self.language = language
+
+
+class _MlxWhisper:
+    """Adapter exposing faster-whisper's `WhisperModel.transcribe(path, language=, initial_prompt=,
+    condition_on_previous_text=, vad_filter=, word_timestamps=) -> (segments, info)` over
+    mlx_whisper.transcribe (an openai-whisper decode-loop port, so the kwargs are name-compatible).
+    backend._asr_only joins segment `.text` and reads `info.language`."""
+
+    def __init__(self, local_path: str):
+        self._path = local_path
+
+    def transcribe(
+        self,
+        wav_path: str,
+        *,
+        language: str | None = None,
+        initial_prompt: str | None = None,
+        condition_on_previous_text: bool = False,
+        vad_filter: bool = False,  # noqa: ARG002 -- faster-whisper arg; mlx_whisper has none (VAD upstream)
+        word_timestamps: bool = False,
+    ) -> tuple[list[_WhisperSegment], _WhisperInfo]:
+        try:
+            import mlx_whisper
+        except ModuleNotFoundError as e:
+            raise _require(e.name or "mlx_whisper") from e
+        res = mlx_whisper.transcribe(
+            str(wav_path),
+            path_or_hf_repo=self._path,
+            language=language,
+            initial_prompt=initial_prompt,
+            condition_on_previous_text=condition_on_previous_text,
+            word_timestamps=word_timestamps,
+        )
+        segs = [_WhisperSegment(s.get("text", "")) for s in res.get("segments", [])]
+        if not segs and res.get(
+            "text"
+        ):  # no per-segment breakdown -> single full-text segment
+            segs = [_WhisperSegment(res["text"])]
+        return segs, _WhisperInfo(res.get("language"))
+
+
+def get_whisper(model_id: str):
+    """Lazy-load the MLX whisper adapter singleton, reloading if the requested size changes.
+
+    Mirrors backend._get_whisper: snapshot-downloads the converted repo into VoxWeave's ASR cache,
+    then hands the local dir to mlx_whisper.transcribe (which lru-caches the loaded weights)."""
+    global _whisper, _whisper_id
+    if _whisper is not None and _whisper_id != model_id:
+        release_whisper()
+    if _whisper is None:
+        repo = _mlx_whisper_repo(model_id)
+        log.info("loading MLX whisper=%s", repo)
+        _whisper = _MlxWhisper(_snapshot(repo, config.ASR_CACHE))
+        _whisper_id = model_id
+        log.info("MLX whisper ready")
+    return _whisper
+
+
+def release_whisper() -> None:
+    """Drop the MLX whisper singleton (called between fusion passes to cut peak memory)."""
+    global _whisper, _whisper_id
+    _whisper = None
+    _whisper_id = None
+    _clear_cache()
+
+
 def _get_aligner():
     """Lazy-load the MLX Qwen3-ForcedAligner singleton."""
     global _aligner
@@ -196,5 +316,6 @@ def release() -> None:
     """Drop all MLX singletons. Safe no-op when the MLX backend was never used."""
     global _aligner
     release_asr()
+    release_whisper()
     _aligner = None
     _clear_cache()

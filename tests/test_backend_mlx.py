@@ -206,6 +206,115 @@ def test_get_asr_dispatches_to_mlx(monkeypatch):
     assert seen["mid"] == "Qwen/Qwen3-ASR-1.7B"  # resolved before dispatch
 
 
+# ───────────────────────────── whisper (mlx-whisper) ──────────────────────────────
+
+
+def test_mlx_whisper_repo_mapping(monkeypatch):
+    monkeypatch.delenv("VOXWEAVE_MLX_WHISPER_REPO", raising=False)
+    assert (
+        backend_mlx._mlx_whisper_repo("large-v3")
+        == "mlx-community/whisper-large-v3-mlx"
+    )
+    assert (
+        backend_mlx._mlx_whisper_repo("large-v3-turbo")
+        == "mlx-community/whisper-large-v3-turbo"
+    )
+    assert (
+        backend_mlx._mlx_whisper_repo("distil-large-v3")
+        == "mlx-community/distil-whisper-large-v3"
+    )
+    # unknown size -> generic mlx-community convention
+    assert backend_mlx._mlx_whisper_repo("small") == "mlx-community/whisper-small-mlx"
+
+
+def test_mlx_whisper_repo_env_override_wins(monkeypatch):
+    monkeypatch.setenv(
+        "VOXWEAVE_MLX_WHISPER_REPO", "mlx-community/whisper-large-v3-8bit"
+    )
+    assert (
+        backend_mlx._mlx_whisper_repo("large-v3")
+        == "mlx-community/whisper-large-v3-8bit"
+    )
+
+
+def test_mlx_whisper_adapter_mirrors_faster_whisper(monkeypatch):
+    # mlx_whisper.transcribe -> (segments, info) contract that backend._asr_only consumes
+    captured = {}
+    fake_mod = types.ModuleType("mlx_whisper")
+
+    def _transcribe(audio, **kw):
+        captured.update(kw)
+        captured["audio"] = audio
+        return {
+            "text": "ignored when segments present",
+            "segments": [{"text": "hello "}, {"text": "world"}],
+            "language": "en",
+        }
+
+    fake_mod.transcribe = _transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+
+    w = backend_mlx._MlxWhisper("/local/snapshot")
+    segs, info = w.transcribe(
+        "/tmp/a.wav",
+        language="en",
+        initial_prompt="ctx",
+        condition_on_previous_text=False,
+        vad_filter=False,
+        word_timestamps=False,
+    )
+    assert "".join(s.text for s in segs) == "hello world"
+    assert info.language == "en"
+    assert captured["path_or_hf_repo"] == "/local/snapshot"
+    assert captured["language"] == "en"
+    assert captured["initial_prompt"] == "ctx"
+    assert "vad_filter" not in captured  # faster-whisper-only arg dropped
+
+
+def test_mlx_whisper_adapter_falls_back_to_full_text(monkeypatch):
+    # no per-segment breakdown -> single segment from the top-level text
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda audio, **kw: {
+        "text": "solo",
+        "segments": [],
+        "language": "ja",
+    }
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    segs, info = backend_mlx._MlxWhisper("/p").transcribe("/tmp/a.wav")
+    assert [s.text for s in segs] == ["solo"]
+    assert info.language == "ja"
+
+
+def test_get_whisper_dispatches_to_mlx(monkeypatch):
+    monkeypatch.setattr(backend, "_use_mlx", lambda: True)
+    sentinel = object()
+    seen = {}
+
+    def _fake_get_whisper(mid):
+        seen["mid"] = mid
+        return sentinel
+
+    monkeypatch.setattr(backend_mlx, "get_whisper", _fake_get_whisper)
+    assert backend._get_whisper("large-v3") is sentinel
+    assert seen["mid"] == "large-v3"
+
+
+def test_mlx_get_whisper_reloads_on_size_change(monkeypatch):
+    monkeypatch.setattr(backend_mlx, "_whisper", None)
+    monkeypatch.setattr(backend_mlx, "_whisper_id", None)
+    monkeypatch.setattr(
+        backend_mlx, "_snapshot", lambda repo, cache: f"/snap/{repo.split('/')[-1]}"
+    )
+    a = backend_mlx.get_whisper("large-v3")
+    assert backend_mlx._whisper_id == "large-v3"
+    b = backend_mlx.get_whisper("large-v3")  # same size -> same singleton
+    assert b is a
+    backend_mlx.get_whisper("large-v3-turbo")  # size change -> reload
+    assert backend_mlx._whisper_id == "large-v3-turbo"
+    backend_mlx.release_whisper()
+    assert backend_mlx._whisper is None and backend_mlx._whisper_id is None
+
+
 # ───────────────────────────── missing-dependency error ──────────────────────────────
 
 

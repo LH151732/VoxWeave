@@ -229,8 +229,9 @@ _MISSING_HINT = (
 
 _MISSING_WHISPER = (
     "faster-whisper engine requires the voxweave[cuda] install (faster-whisper + qwen-asr aligner; "
-    "CUDA/Linux only — ctranslate2 has no Metal/MPS backend, so it is absent from voxweave[mps]). "
-    "Install: `make install` or `uv pip install -e '.[cuda]'`. Missing: {mod}"
+    "CUDA/Linux only — ctranslate2 has no Metal/MPS backend). On Apple Silicon the whisper engine "
+    "runs via mlx-whisper instead (voxweave[mps]); this torch path is only reached with "
+    "VOXWEAVE_BACKEND=torch. Install: `make install` or `uv pip install -e '.[cuda]'`. Missing: {mod}"
 )
 
 
@@ -765,7 +766,15 @@ def _parse_whisper_device() -> tuple[str, int]:
 
 
 def _get_whisper(model_id: str):
-    """Lazy-load faster-whisper WhisperModel singleton. Reloads if model size changes."""
+    """Lazy-load the whisper engine singleton (reloads if size changes).
+
+    Apple Silicon: mlx-whisper (Metal); ctranslate2/faster-whisper has no Metal backend, so the
+    MLX port supplies the hybrid/fusion engines' text. Else: faster-whisper (CUDA fp16 / CPU int8).
+    """
+    if _use_mlx():
+        from voxweave import backend_mlx
+
+        return backend_mlx.get_whisper(model_id)
     global _whisper, _whisper_id
     if _whisper is not None and _whisper_id != model_id:
         release()
@@ -1420,7 +1429,9 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
                     e,
                 )
 
-    if _use_mlx():  # Apple Silicon: torch qwen-asr aligner is absent -> use the MLX Qwen aligner
+    if (
+        _use_mlx()
+    ):  # Apple Silicon: torch qwen-asr aligner is absent -> use the MLX Qwen aligner
         from voxweave import backend_mlx
 
         return backend_mlx.align(wav_path, text, language)
@@ -1436,10 +1447,14 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
 
 
 def _release_whisper() -> None:
-    """Release faster-whisper singleton. Called between fusion passes to reduce peak VRAM."""
+    """Release the whisper engine singleton. Called between fusion passes to reduce peak VRAM."""
     global _whisper, _whisper_id
     _whisper = None
     _whisper_id = None
+    if _use_mlx():
+        from voxweave import backend_mlx
+
+        backend_mlx.release_whisper()
     _empty_cache()
 
 

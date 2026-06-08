@@ -1,6 +1,6 @@
 [project]
 name = "voxweave"
-version = "0.1.1"
+version = "0.1.2"
 description = "BGM-robust subtitles for anime / film / clips: vocal separation + song-skip so ASR doesn't hallucinate on background music, OP/ED, or insert songs. Local-first Qwen3 ASR + forced alignment + edit-and-resync, CJK-aware."
 requires-python = ">=3.11"
 license = "MIT"
@@ -81,11 +81,13 @@ cuda = [
 # has no Metal provider). mlx is Apple-Silicon-only, so it carries a darwin+arm64 marker.
 # qwen-asr is excluded from core on darwin (its transformers==4.57.6 pin conflicts with mlx-audio's
 # transformers>=5.5), so the MLX backend is the ASR/alignment path on macOS. onnxruntime (CPU/CoreML)
-# is kept for the torch fallback's CTC aligners (VOXWEAVE_BACKEND=torch). faster-whisper is
-# deliberately omitted: ctranslate2 has no Metal backend. torch's macOS wheel ships MPS built in.
+# is kept for the torch fallback's CTC aligners (VOXWEAVE_BACKEND=torch). faster-whisper is omitted
+# (ctranslate2 has no Metal backend); the hybrid/fusion engines' whisper text comes from mlx-whisper
+# (the Metal port) instead — see voxweave.backend_mlx.get_whisper. torch's macOS wheel ships MPS in.
 mps = [
   "onnxruntime>=1.20; sys_platform == 'darwin'",
   "mlx-audio>=0.4.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [dependency-groups]

@@ -47,7 +47,9 @@ def _load(wav: Path) -> np.ndarray:
     a, sr = sf.read(str(wav), dtype="float32", always_2d=False)
     if a.ndim > 1:
         a = a.mean(axis=1)
-    assert sr == SR, f"expected {SR} Hz, got {sr}; resample first: ffmpeg -ar 32000 -ac 1"
+    assert sr == SR, (
+        f"expected {SR} Hz, got {sr}; resample first: ffmpeg -ar 32000 -ac 1"
+    )
     return a
 
 

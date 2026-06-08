@@ -62,7 +62,8 @@ breaks) handles Chinese/Japanese/English as first-class.
   insert songs before ASR — on by default, `--no-skip-songs` to keep them.
 - **Local Qwen3 ASR + forced alignment.** Text and word-level timestamps in one pass, fully
   on-device — in-process PyTorch on NVIDIA, or the native MLX Qwen3 models on Apple Silicon. A
-  faster-whisper hybrid engine is available on NVIDIA for when you prefer Whisper text.
+  Whisper hybrid engine is also available for when you prefer Whisper text (faster-whisper on
+  NVIDIA, the native MLX Whisper port on Apple Silicon).
 - **Edit-and-resync.** Fix the transcript by hand, then `align` re-derives timestamps from
   the audio — timestamps are _never_ hand-written.
 - **CJK-aware.** Japanese aligns with MMS-300m + uroman (zero-OOV, immune to the per-cue
@@ -106,7 +107,7 @@ Override the torch index per-invocation: `make install TORCH_BACKEND=cpu`.
 # NVIDIA / Linux:
 uv tool install --torch-backend=cu128 "voxweave[cuda]"   # full pipeline + faster-whisper hybrid
 # Apple Silicon / macOS:
-uv tool install "voxweave[mps]"                          # full pipeline, Qwen-only
+uv tool install "voxweave[mps]"                          # full pipeline + MLX Whisper hybrid
 ```
 
 The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
@@ -120,10 +121,11 @@ Japanese/CJK), layout, song-skip — plus CJK line-break and translation are bak
   the forced-align DP falls to CPU as torchaudio has no Metal kernel), Japanese/CJK on the ONNX
   MMS aligner (CoreML/CPU — onnxruntime has no Metal provider). Only the Qwen fallback (zh·yue,
   or any CTC failure) is served by the MLX Qwen3-ForcedAligner, since the torch `qwen-asr` aligner
-  is absent here. Vocal separation (MelBandRoformer) + PANNs song-skip stay on torch-MPS;
-  faster-whisper is omitted (ctranslate2 has no Metal backend). `qwen-asr` is excluded because its
-  `transformers==4.57.6` pin conflicts with mlx-audio, so `[cuda]` and `[mps]` are mutually
-  exclusive — pick one per host.
+  is absent here. The Whisper hybrid/fusion engines (`--model large-v3`, `--hybrid`) run on the
+  native [`mlx-whisper`](https://pypi.org/project/mlx-whisper/) Metal port instead of faster-whisper
+  (ctranslate2 has no Metal backend). Vocal separation (MelBandRoformer) + PANNs song-skip stay on
+  torch-MPS. `qwen-asr` is excluded because its `transformers==4.57.6` pin conflicts with mlx-audio,
+  so `[cuda]` and `[mps]` are mutually exclusive — pick one per host.
 
 **From source** (for development or pulling new code):
 
@@ -307,7 +309,7 @@ them. Edit the text freely; `align` puts the timing back.
 | **Separation**  | Mel-Band Roformer (full-band 44.1k stereo, vendored pure-torch) isolates vocals; downsampled to 16k afterwards.            |
 | **Song-skip**   | PANNs (route ii) flags singing/music on the separated vocals before ASR.                                                   |
 | **Chunking**    | Silero VAD splits speech into ≤120s chunks (longer risks ASR repetition-loop collapse).                                    |
-| **ASR + align** | Qwen3-ASR (default, text + units in one pass) / faster-whisper hybrid / dual-ASR fusion — the pipeline is engine-agnostic. |
+| **ASR + align** | Qwen3-ASR (default, text + units in one pass) / Whisper hybrid (faster-whisper on cuda, mlx-whisper on mps) / dual-ASR fusion — the pipeline is engine-agnostic. |
 | **Alignment**   | `ja` → MMS-300m + uroman (full-file single pass, WhisperX-gold); `en` → wav2vec2-LV60K CTC per-cue; `zh`·`yue` → Qwen.     |
 | **Layout**      | gap-aware `smart_split`: word-level gaps + BudouX phrase atoms + line-length, on a shared timeline forked per language.    |
 
@@ -326,9 +328,10 @@ default config is written on first run (migrated automatically from a pre-rename
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
 - `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
 - `VOXWEAVE_OFFLINE` (`1` to enable) — once all models are cached, sets `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` so loading skips the per-file HEAD revalidation + optional-file probing huggingface_hub/transformers otherwise do on every run (no network on a cache hit). Leave off for the first download.
-- `VOXWEAVE_MLX_ASR_REPO` / `VOXWEAVE_MLX_ALIGNER_REPO` — MLX backend repos. By default the ASR repo
-  tracks `--model` size (`--model 1.7b` → `mlx-community/Qwen3-ASR-1.7B-8bit`); set `VOXWEAVE_MLX_ASR_REPO`
-  to hard-pin a specific quant (e.g. a 4-bit build) regardless of `--model`.
+- `VOXWEAVE_MLX_ASR_REPO` / `VOXWEAVE_MLX_ALIGNER_REPO` / `VOXWEAVE_MLX_WHISPER_REPO` — MLX backend
+  repos. By default the ASR repo tracks `--model` size (`--model 1.7b` → `mlx-community/Qwen3-ASR-1.7B-8bit`)
+  and the Whisper repo tracks the Whisper size (`--model large-v3` → `mlx-community/whisper-large-v3-mlx`);
+  set the matching var to hard-pin a specific quant (e.g. a 4-bit build) regardless of `--model`.
 
 All model weights (torch + MLX) are cached under `~/.cache/voxweave/{asr,align,audio}`
 (auto-downloaded on first use; override the root with `VOXWEAVE_CACHE_ROOT`), so a container only
@@ -378,7 +381,7 @@ load_strategy = "sum"
 
 # dual-ASR fusion sub-models — only consulted when running with --hybrid.
 [fusion]
-whisper = "large-v3-turbo"               # faster-whisper size: large-v3 (best) | large-v3-turbo (~5x faster)
+whisper = "large-v3-turbo"               # Whisper size: large-v3 (best) | large-v3-turbo (~5x faster); faster-whisper on cuda, mlx-whisper on mps
 qwen    = "Qwen/Qwen3-ASR-1.7B"          # punctuation model; must emit punctuation -> 1.7B, not 0.6B
 
 # Per-language forced-alignment model. Key = ISO-639-1 code; unlisted languages use Qwen3-ForcedAligner.
