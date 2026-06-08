@@ -1,5 +1,6 @@
 import numpy as np
 
+from voxweave import songdet
 from voxweave.songdet import (
     IDX_MUSIC,
     IDX_SING,
@@ -13,6 +14,45 @@ from voxweave.songdet import (
     song_flags,
     speech_flags,
 )
+
+
+def test_ensure_panns_labels_noop_when_present(monkeypatch, tmp_path):
+    # CSV already at ~/panns_data -> no download attempted (urllib/hf would raise if called)
+    monkeypatch.setattr(songdet.Path, "home", staticmethod(lambda: tmp_path))
+    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
+    dst.parent.mkdir(parents=True)
+    dst.write_text("index,mid,display_name\n")
+
+    def _boom(*a, **k):
+        raise AssertionError("must not download when csv already present")
+
+    monkeypatch.setattr("urllib.request.urlopen", _boom)
+    songdet._ensure_panns_labels()  # should return immediately, no exception
+
+
+def test_ensure_panns_labels_falls_back_to_url(monkeypatch, tmp_path):
+    # HF download fails -> urllib fetches the canonical csv and writes it to ~/panns_data
+    monkeypatch.setattr(songdet.Path, "home", staticmethod(lambda: tmp_path))
+
+    def _hf_fail(*a, **k):
+        raise RuntimeError("repo has no csv")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", _hf_fail)
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"index,mid,display_name\n0,/m/x,Speech\n"
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Resp())
+    songdet._ensure_panns_labels()
+    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
+    assert dst.read_bytes().startswith(b"index,mid,display_name")
 
 
 def _probs(rows: list[dict]) -> np.ndarray:

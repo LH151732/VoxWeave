@@ -5,6 +5,29 @@ import pytest
 from voxweave import backend
 
 
+@pytest.fixture(autouse=True)
+def _force_torch_backend(monkeypatch):
+    """Pin the torch backend for this module so ASR/alignment dispatch is deterministic regardless
+    of host device (on Apple Silicon _use_mlx() would otherwise route to MLX). The MLX backend has
+    its own coverage in test_backend_mlx.py."""
+    monkeypatch.setattr(backend, "_use_mlx", lambda: False)
+
+
+def _block_import(monkeypatch, *names):
+    """Force ModuleNotFoundError for the given top-level modules so missing-dependency error paths
+    are exercised deterministically whether or not the package is installed in the test env."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked(name, *a, **k):
+        if any(name == n or name.startswith(n + ".") for n in names):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+
+
 def test_strip_state_dict_unwraps_and_deprefixes():
     # Lightning wraps with a state_dict layer + model. prefix; both should be stripped
     sd = {"state_dict": {"model.a": 1, "model.b": 2}}
@@ -15,12 +38,13 @@ def test_strip_state_dict_plain_passthrough():
     assert backend._strip_state_dict({"a": 1, "b": 2}) == {"a": 1, "b": 2}
 
 
-def test_transcribe_align_missing_models_raises_friendly(tmp_path):
-    # qwen-asr not installed in this test env -> friendly RuntimeError pointing to voxweave[qwen], not bare ModuleNotFoundError
+def test_transcribe_align_missing_models_raises_friendly(monkeypatch, tmp_path):
+    # qwen-asr import blocked -> friendly RuntimeError pointing to voxweave[cuda]/[mps], not bare ModuleNotFoundError
+    _block_import(monkeypatch, "qwen_asr")
     backend._asr = None  # ensure not loaded
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    with pytest.raises(RuntimeError, match=r"voxweave\[qwen\]"):
+    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]"):
         backend.transcribe_align(wav, language=None, asr_model="qwen3-asr-1.7b")
 
 
@@ -128,12 +152,13 @@ def test_qwen_align_empty_text_skips_align(monkeypatch, tmp_path):
     )
 
 
-def test_align_text_missing_models_raises_friendly(tmp_path):
-    # qwen-asr not installed -> align_text also raises a friendly RuntimeError pointing to voxweave[qwen]
+def test_align_text_missing_models_raises_friendly(monkeypatch, tmp_path):
+    # qwen-asr import blocked -> align_text also raises a friendly RuntimeError pointing to voxweave[cuda]/[mps]
+    _block_import(monkeypatch, "qwen_asr")
     backend._aligner = None
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    with pytest.raises(RuntimeError, match=r"voxweave\[qwen\]"):
+    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]"):
         backend.align_text(wav, "你好", "zh")
 
 
@@ -595,10 +620,11 @@ def test_chunk_pass_count():
     assert backend.chunk_pass_count("fusion", "sum") == 1
 
 
-def test_get_whisper_missing_dep_raises_friendly():
-    # faster-whisper not installed in this test env -> friendly RuntimeError pointing to voxweave[whisper]
+def test_get_whisper_missing_dep_raises_friendly(monkeypatch):
+    # faster-whisper import blocked -> friendly RuntimeError pointing to voxweave[cuda]
+    _block_import(monkeypatch, "faster_whisper")
     backend._whisper = None
-    with pytest.raises(RuntimeError, match=r"voxweave\[whisper\]"):
+    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]"):
         backend._get_whisper("large-v3-turbo")
 
 
@@ -612,11 +638,11 @@ def test_release_clears_whisper(monkeypatch):
 
 
 def test_parse_whisper_device_splits_cuda_index(monkeypatch):
-    monkeypatch.setattr(backend, "DEVICE", "cuda:0")
+    monkeypatch.setattr(backend, "_DEVICE", "cuda:0")
     assert backend._parse_whisper_device() == ("cuda", 0)
-    monkeypatch.setattr(backend, "DEVICE", "cuda:1")
+    monkeypatch.setattr(backend, "_DEVICE", "cuda:1")
     assert backend._parse_whisper_device() == ("cuda", 1)
-    monkeypatch.setattr(backend, "DEVICE", "cpu")
+    monkeypatch.setattr(backend, "_DEVICE", "cpu")
     assert backend._parse_whisper_device() == ("cpu", 0)
 
 
@@ -748,12 +774,13 @@ def test_whisper_align_cantonese_uses_zh_for_whisper(monkeypatch, tmp_path):
     assert align_calls.get("lang") == "yue"
 
 
-def test_transcribe_align_whisper_missing_dep_raises_friendly(tmp_path):
-    # select whisper engine via the public transcribe_align entry point; faster-whisper not installed -> friendly voxweave[whisper] error
+def test_transcribe_align_whisper_missing_dep_raises_friendly(monkeypatch, tmp_path):
+    # select whisper engine via the public transcribe_align entry point; faster-whisper import blocked -> friendly voxweave[cuda] error
+    _block_import(monkeypatch, "faster_whisper")
     backend._whisper = None
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    with pytest.raises(RuntimeError, match=r"voxweave\[whisper\]"):
+    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]"):
         backend.transcribe_align(wav, None, asr_model="large-v3-turbo")
 
 
@@ -853,21 +880,23 @@ def test_align_text_ctc_failure_falls_back_to_qwen(monkeypatch, tmp_path):
         raise RuntimeError("ctc broke")
 
     monkeypatch.setattr(backend, "align_text_ctc", _boom)
+    _block_import(monkeypatch, "qwen_asr")
     backend._aligner = None
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    # CTC fails -> falls back to Qwen -> qwen_asr absent -> friendly voxweave[qwen] error
-    with pytest.raises(RuntimeError, match=r"voxweave\[qwen\]"):
+    # CTC fails -> falls back to Qwen -> qwen_asr import blocked -> friendly voxweave[cuda]/[mps] error
+    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]"):
         backend.align_text(wav, "hello there", "en")
 
 
 def test_align_text_qwen_for_unconfigured_lang(monkeypatch, tmp_path):
     monkeypatch.setattr(backend.config, "align_model_for", lambda iso: None)
+    _block_import(monkeypatch, "qwen_asr")
     backend._aligner = None
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
     # no CTC configured (None) -> skip CTC -> Qwen path -> friendly error
-    with pytest.raises(RuntimeError, match=r"voxweave\[qwen\]"):
+    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]"):
         backend.align_text(wav, "你好", "zh")
 
 

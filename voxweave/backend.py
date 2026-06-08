@@ -116,8 +116,63 @@ SEPARATOR_REPO_FILE = os.environ.get(
 _BUNDLED_SEPARATOR_CONFIG = (
     Path(__file__).parent / "vendor" / "vocals_mel_band_roformer.yaml"
 )
-DEVICE = os.environ.get("VOXWEAVE_DEVICE", "cuda:0")
-# Empty -> float16 on cuda, int8 on cpu.
+# Compute device, resolved lazily on first use so importing voxweave never pulls in torch.
+# VOXWEAVE_DEVICE overrides ('cuda:0' / 'mps' / 'cpu'); otherwise autodetect cuda -> mps -> cpu.
+_DEVICE: str | None = None
+
+
+def get_device() -> str:
+    """Resolve the compute device once and cache it. Env override wins; else cuda > mps > cpu."""
+    global _DEVICE
+    if _DEVICE is None:
+        env = os.environ.get("VOXWEAVE_DEVICE", "").strip()
+        if env:
+            _DEVICE = env
+        else:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    _DEVICE = "cuda:0"
+                elif (
+                    getattr(torch.backends, "mps", None)
+                    and torch.backends.mps.is_available()
+                ):
+                    _DEVICE = "mps"
+                else:
+                    _DEVICE = "cpu"
+            except Exception:  # noqa: BLE001 -- torch absent/broken -> CPU is the safe default
+                _DEVICE = "cpu"
+    return _DEVICE
+
+
+def _model_dtype(device: str):
+    """Per-device load dtype: bfloat16 on CUDA, float16 on MPS (bf16 is only partially supported
+    on Metal), float32 on CPU."""
+    import torch
+
+    if device.startswith("cuda"):
+        return torch.bfloat16
+    if device == "mps":
+        return torch.float16
+    return torch.float32
+
+
+def _use_mlx() -> bool:
+    """True if the MLX (Apple Silicon) backend should serve ASR + forced alignment.
+
+    VOXWEAVE_BACKEND=mlx|torch overrides; otherwise auto-on when the resolved device is mps.
+    See voxweave.backend_mlx for the adapters; separation/song-skip always stay on torch.
+    """
+    env = os.environ.get("VOXWEAVE_BACKEND", "").strip().lower()
+    if env == "mlx":
+        return True
+    if env == "torch":
+        return False
+    return get_device() == "mps"
+
+
+# Empty -> float16 on cuda, int8 on cpu/mps (ctranslate2/faster-whisper is CUDA-or-CPU only).
 WHISPER_COMPUTE = os.environ.get("VOXWEAVE_WHISPER_COMPUTE", "")
 
 # ASR/alignment process-level singletons; call release() at end of episode.
@@ -165,14 +220,17 @@ CTC_MAX_DP_FRAMES = config.conf_ctc_max_dp_frames()
 CTC_DP_CHUNK_FRAC = float(os.environ.get("VOXWEAVE_CTC_DP_CHUNK_FRAC", "0.8"))
 
 _MISSING_HINT = (
-    "Local model loading requires voxweave[qwen] (qwen-asr + einops/rotary-embedding-torch/...) + torch. "
-    "Install: `make install` (Blackwell: use `make cuda` to force cu128 wheel). Missing: {mod}"
+    "Local model loading requires the voxweave[cuda] or voxweave[mps] install "
+    "(qwen-asr + einops/rotary-embedding-torch/... + torch). "
+    "Install: `make install` (NVIDIA/Linux, cu128 wheel) or `make install VARIANT=mps` "
+    "(Apple Silicon/macOS). Missing: {mod}"
 )
 
 
 _MISSING_WHISPER = (
-    "faster-whisper engine requires voxweave[whisper] (faster-whisper + qwen-asr aligner). "
-    "Install: `uv pip install -e '.[whisper]'` or make install EXTRAS=...,whisper. Missing: {mod}"
+    "faster-whisper engine requires the voxweave[cuda] install (faster-whisper + qwen-asr aligner; "
+    "CUDA/Linux only — ctranslate2 has no Metal/MPS backend, so it is absent from voxweave[mps]). "
+    "Install: `make install` or `uv pip install -e '.[cuda]'`. Missing: {mod}"
 )
 
 
@@ -200,7 +258,11 @@ def _empty_cache() -> None:
     try:
         import torch
 
-        torch.cuda.empty_cache()
+        dev = get_device()
+        if dev.startswith("cuda"):
+            torch.cuda.empty_cache()
+        elif dev == "mps":
+            torch.mps.empty_cache()
     except Exception:  # noqa: BLE001
         pass
 
@@ -300,8 +362,9 @@ def _load_separator():
     # weights_only=True: disables arbitrary-object deserialization (prevents pickle RCE)
     sd = _strip_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
     model.load_state_dict(sd)
-    model.to(DEVICE).eval()
-    log.info("loaded separator ckpt=%s on %s", ckpt, DEVICE)
+    dev = get_device()
+    model.to(dev).eval()
+    log.info("loaded separator ckpt=%s on %s", ckpt, dev)
     return model, cfg
 
 
@@ -388,24 +451,30 @@ def _get_asr(asr_model: str | None = None):
     dtype kwarg (not torch_dtype) reflects transformers 4.57.6 API.
     Reloads if the model repo changes.
     """
+    if (
+        _use_mlx()
+    ):  # Apple Silicon: serve ASR from the native MLX Qwen3-ASR (see backend_mlx)
+        from voxweave import backend_mlx
+
+        return backend_mlx.get_asr(resolve_asr_model(asr_model))
     global _asr, _asr_id
     mid = resolve_asr_model(asr_model)
     if _asr is not None and _asr_id != mid:  # model changed -> release old one
         release()
     if _asr is None:
         try:
-            import torch
             from qwen_asr import Qwen3ASRModel
         except ModuleNotFoundError as e:
             raise _require(e.name or "qwen_asr") from e
 
-        log.info("loading ASR=%s (text-only) on %s", mid, DEVICE)
+        dev = get_device()
+        log.info("loading ASR=%s (text-only) on %s", mid, dev)
         # Use snapshot so model + processor both land in config.ASR_CACHE (see _hf_snapshot docstring).
         local = _hf_snapshot(mid, config.ASR_CACHE)
         _asr = Qwen3ASRModel.from_pretrained(
             local,
-            dtype=torch.bfloat16,
-            device_map=DEVICE,
+            dtype=_model_dtype(dev),
+            device_map=dev,
         )
         _asr_id = mid
         log.info("ASR ready")
@@ -670,24 +739,25 @@ def _get_aligner():
     global _aligner
     if _aligner is None:
         try:
-            import torch
             from qwen_asr import Qwen3ForcedAligner
         except ModuleNotFoundError as e:
             raise _require(e.name or "qwen_asr") from e
 
-        log.info("loading forced aligner=%s on %s", ALIGNER_MODEL, DEVICE)
+        dev = get_device()
+        log.info("loading forced aligner=%s on %s", ALIGNER_MODEL, dev)
         # Use snapshot so model + processor both land in config.ALIGN_CACHE (see _hf_snapshot docstring).
         local = _hf_snapshot(ALIGNER_MODEL, config.ALIGN_CACHE)
         _aligner = Qwen3ForcedAligner.from_pretrained(
-            local, dtype=torch.bfloat16, device_map=DEVICE
+            local, dtype=_model_dtype(dev), device_map=dev
         )
         log.info("forced aligner ready")
     return _aligner
 
 
 def _parse_whisper_device() -> tuple[str, int]:
-    """VOXWEAVE_DEVICE ('cuda:0'/'cuda'/'cpu') -> faster-whisper's (device, device_index)."""
-    dev = DEVICE.strip()
+    """Resolved device ('cuda:0'/'cuda'/'mps'/'cpu') -> faster-whisper's (device, device_index).
+    ctranslate2 has no Metal backend, so mps (and anything non-cuda) maps to CPU."""
+    dev = get_device().strip()
     if dev.startswith("cuda"):
         idx = int(dev.split(":", 1)[1]) if ":" in dev else 0
         return "cuda", idx
@@ -850,11 +920,12 @@ def _get_ctc_aligner(iso: str, model_name: str):
     if _ctc is None:
         import torchaudio
 
+        dev = get_device()
         if (
             model_name in torchaudio.pipelines.__all__
         ):  # torchaudio bundle (English large)
             bundle = torchaudio.pipelines.__dict__[model_name]
-            model = bundle.get_model().to(DEVICE).eval()
+            model = bundle.get_model().to(dev).eval()
             labels = bundle.get_labels()
             sep_id = labels.index("|") if "|" in labels else -1
             invocab = {c: i for i, c in enumerate(labels) if i not in (0, sep_id)}
@@ -870,7 +941,7 @@ def _get_ctc_aligner(iso: str, model_name: str):
             )
             model = (
                 Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=config.ALIGN_CACHE)
-                .to(DEVICE)
+                .to(dev)
                 .eval()
             )
             vocab = proc.tokenizer.get_vocab()  # {char: id}
@@ -889,7 +960,7 @@ def _get_ctc_aligner(iso: str, model_name: str):
             iso,
             model_name,
             _ctc.kind,
-            DEVICE,
+            dev,
         )
     return _ctc
 
@@ -909,9 +980,9 @@ def _ctc_logp(al, wav):
             inp = al.proc(
                 wav.cpu().numpy(), sampling_rate=al.sr, return_tensors="pt"
             ).input_values
-            logits = al.model(inp.to(DEVICE)).logits[0]
+            logits = al.model(inp.to(get_device())).logits[0]
         else:  # torchaudio bundle: raw wav, returns (emissions, lengths)
-            emis, _ = al.model(wav.unsqueeze(0).to(DEVICE))
+            emis, _ = al.model(wav.unsqueeze(0).to(get_device()))
             logits = emis[0]
         return torch.log_softmax(logits, dim=-1)  # [T,V]
 
@@ -967,6 +1038,11 @@ def _ctc_align_logp(al, logp, toks, meta, words, nospace, total_samples):
         logp = torch.cat([logp, star.unsqueeze(1)], dim=1)
         star_id = logp.shape[1] - 1
         toks = [star_id if t is None else t for t in toks]
+    # torchaudio.forced_align has no MPS kernel, so on Apple Silicon run the (cheap) DP on CPU —
+    # emissions stay on MPS for the forward. CUDA is left untouched: forced_align runs on the GPU
+    # exactly as before (the DP is deterministic, so CPU/CUDA give identical alignments).
+    if logp.device.type == "mps":
+        logp = logp.detach().to("cpu")
     targets = torch.tensor([toks], dtype=torch.int32, device=logp.device)
     aligned, scores = AF.forced_align(
         logp.unsqueeze(0).contiguous(), targets, blank=al.blank
@@ -1158,9 +1234,10 @@ def _resolve_mms_onnx() -> str:
 def _get_mms_aligner() -> CtcMms:
     """Lazy-load MMS-300m ONNX session + tokenizer singleton, cleared on release().
 
-    Same model as whisperx --align_backend ctc. Uses CUDAExecutionProvider when available.
-    onnxruntime CPU build must be overridden in uv deps: ctc-forced-aligner + faster-whisper both
-    hard-depend on CPU onnxruntime, which shadows onnxruntime-gpu and drops CUDAExecutionProvider.
+    Same model as whisperx --align_backend ctc. Picks the ONNX execution provider from the
+    resolved device: CUDA on the [cuda] build (onnxruntime-gpu — the CPU onnxruntime is dropped
+    on Linux via [tool.uv] so it can't shadow the GPU build); CoreML when available on macOS/MPS
+    ([mps] build ships plain onnxruntime); CPU otherwise.
     """
     global _mms
     if _mms is None:
@@ -1170,11 +1247,15 @@ def _get_mms_aligner() -> CtcMms:
         except ModuleNotFoundError as e:
             raise _require(e.name or "ctc_forced_aligner") from e
         onnx_path = _resolve_mms_onnx()
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if DEVICE.startswith("cuda")
-            else ["CPUExecutionProvider"]
-        )
+        dev = get_device()
+        avail = ort.get_available_providers()
+        if dev.startswith("cuda"):
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        elif dev == "mps" and "CoreMLExecutionProvider" in avail:
+            # CoreML EP falls back to CPU per-op for anything Metal can't run, so this is safe.
+            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        else:
+            providers = ["CPUExecutionProvider"]
         so = ort.SessionOptions()
         so.log_severity_level = 3  # suppress CUDA Memcpy WARNINGs (advisory only)
         sess = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
@@ -1314,8 +1395,13 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
     """Forced alignment -> units [{text,start,end}]. language accepts ISO or full name.
 
     Dispatch: if config.align_model_for(iso) is set, use CTC (mms/ctc alias -> align_text_mms;
-    torchaudio bundle / HF wav2vec2 id -> align_text_ctc). CTC failure falls back to
+    torchaudio bundle / HF wav2vec2 id -> align_text_ctc). CTC failure falls back to the
     Qwen3ForcedAligner. Languages with no CTC config go directly to Qwen.
+
+    The CTC aligners run on every backend (wav2vec2 is torch -> MPS-capable; MMS is onnxruntime ->
+    CoreML/CPU on macOS), so English keeps its WhisperX-grade wav2vec2 alignment even on Apple
+    Silicon. Only the Qwen fallback differs: on the MLX backend the torch qwen-asr aligner is
+    absent, so the native MLX Qwen3-ForcedAligner serves it instead.
     """
     from voxweave.lang import is_supported, to_aligner_name, to_iso
 
@@ -1333,6 +1419,11 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
                     type(e).__name__,
                     e,
                 )
+
+    if _use_mlx():  # Apple Silicon: torch qwen-asr aligner is absent -> use the MLX Qwen aligner
+        from voxweave import backend_mlx
+
+        return backend_mlx.align(wav_path, text, language)
 
     aligner = _get_aligner()
     results = aligner.align(str(wav_path), text, to_aligner_name(language))
@@ -1357,6 +1448,10 @@ def _release_qwen_asr() -> None:
     global _asr, _asr_id
     _asr = None
     _asr_id = None
+    if _use_mlx():
+        from voxweave import backend_mlx
+
+        backend_mlx.release_asr()
     _empty_cache()
 
 
@@ -1369,4 +1464,8 @@ def release() -> None:
     _ctc = None
     _ctc_lang = None
     _mms = None
+    if _use_mlx():
+        from voxweave import backend_mlx
+
+        backend_mlx.release()
     _empty_cache()

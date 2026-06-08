@@ -31,6 +31,13 @@ def install_logging(*, verbose: bool = False) -> None:
     """Attach root logger to rich, sharing the console with the progress bar."""
     import warnings
 
+    # VOXWEAVE_OFFLINE=1 -> fully offline once everything is cached: hf_hub/transformers skip the
+    # per-file HEAD revalidation + optional-file probing (chat_template / safetensors PR / etc.) they
+    # do in online mode even on a cache hit. Must be set before huggingface_hub/transformers import
+    # (read at import time); install_logging runs at startup, before the lazy backend imports.
+    if os.environ.get("VOXWEAVE_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     # TRANSFORMERS_VERBOSITY must be set before the first import; setLevel after import
     # is overridden by transformers itself. Suppresses per-chunk pad_token_id notices.
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -50,6 +57,12 @@ def install_logging(*, verbose: bool = False) -> None:
     # transformers logs "Setting pad_token_id..." on every .transcribe() call via logging, not
     # warnings — suppress by setting ERROR (retains real errors, drops per-chunk noise).
     logging.getLogger("transformers").setLevel(logging.ERROR)
+    # Third-party HTTP clients log every request at INFO ("HTTP Request: GET ... 200 OK"): the
+    # huggingface_hub cache revalidation + optional-file probing floods the console on each run.
+    # Drop them to WARNING so only genuine problems surface (set VOXWEAVE_OFFLINE=1 to skip the
+    # requests entirely once cached).
+    for _noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3", "filelock"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 class _MofNIfKnown(ProgressColumn):

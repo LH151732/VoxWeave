@@ -12,6 +12,7 @@ insert songs. Local-first Qwen3 ASR, forced alignment, and edit-and-resync — C
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)
 ![CUDA cu128](https://img.shields.io/badge/CUDA-cu128-76B900?logo=nvidia&logoColor=white)
+![Apple Silicon MLX](https://img.shields.io/badge/Apple_Silicon-MLX-000000?logo=apple&logoColor=white)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/hali0515)
 
 https://github.com/user-attachments/assets/e75b6dd3-fa37-4afe-89db-b6ee2c28f6bc
@@ -21,9 +22,10 @@ https://github.com/user-attachments/assets/e75b6dd3-fa37-4afe-89db-b6ee2c28f6bc
 </div>
 
 > [!NOTE]
-> **100% local.** Separation, ASR, and forced alignment all run in-process with PyTorch on
-> your GPU — no network endpoints, no audio leaves the machine. Weights download once on
-> first run. (Translation and ASR-correction are the only optional features that call an
+> **100% local.** Separation, ASR, and forced alignment all run in-process on your GPU — no
+> network endpoints, no audio leaves the machine. Runs on **NVIDIA CUDA** (PyTorch) and on
+> **Apple Silicon**, where ASR + alignment use the native **MLX** Qwen3 models. Weights download
+> once on first run. (Translation and ASR-correction are the only optional features that call an
 > external LLM, and only when you invoke them.)
 
 VoxWeave derives from the WhisperX "edit-and-resync" workflow: transcribe once, then edit
@@ -59,7 +61,8 @@ breaks) handles Chinese/Japanese/English as first-class.
 - **Song-skip.** PANNs detects singing/music on the separated vocals and skips OP/ED and
   insert songs before ASR — on by default, `--no-skip-songs` to keep them.
 - **Local Qwen3 ASR + forced alignment.** Text and word-level timestamps in one pass, fully
-  on-device. A faster-whisper hybrid engine is available for when you prefer Whisper text.
+  on-device — in-process PyTorch on NVIDIA, or the native MLX Qwen3 models on Apple Silicon. A
+  faster-whisper hybrid engine is available on NVIDIA for when you prefer Whisper text.
 - **Edit-and-resync.** Fix the transcript by hand, then `align` re-derives timestamps from
   the audio — timestamps are _never_ hand-written.
 - **CJK-aware.** Japanese aligns with MMS-300m + uroman (zero-OOV, immune to the per-cue
@@ -69,7 +72,8 @@ breaks) handles Chinese/Japanese/English as first-class.
 
 ## Setup
 
-Requires an **NVIDIA GPU** (Blackwell sm_120 / cu128 by default) and `ffmpeg` on PATH.
+Two install variants: **`voxweave[cuda]`** (NVIDIA GPU — Blackwell sm_120 / cu128 by default)
+and **`voxweave[mps]`** (Apple Silicon / macOS). Both need `ffmpeg` on PATH.
 
 <details>
 <summary><b>Install ffmpeg</b></summary>
@@ -88,32 +92,45 @@ brew install ffmpeg
 <details>
 <summary><b>CUDA / PyTorch notes</b></summary>
 
-The torch wheel is pinned to the **cu128** build (Blackwell sm_120) and installed into an
-isolated `uv` tool venv. The CUDA toolkit does **not** need to be installed separately — the
-cu128 wheel bundles the required runtime libraries; only an NVIDIA driver is required on the
-host. To build for a different target, override per-invocation: `make install TORCH_BACKEND=cpu`.
+On the `[cuda]` variant the torch wheel is pinned to the **cu128** build (Blackwell sm_120) and
+installed into an isolated `uv` tool venv. The CUDA toolkit does **not** need to be installed
+separately — the cu128 wheel bundles the required runtime libraries; only an NVIDIA driver is
+required on the host. The `[mps]` variant uses the default PyPI torch wheel (Metal/MPS built in).
+Override the torch index per-invocation: `make install TORCH_BACKEND=cpu`.
 
 </details>
 
 **Install from PyPI** (puts the global `voxweave` command on PATH):
 
 ```bash
-uv tool install --torch-backend=cu128 voxweave              # core pipeline — same as voxweave[qwen]
-uv tool install --torch-backend=cu128 "voxweave[whisper]"   # + faster-whisper hybrid engine
-uv tool install --torch-backend=cu128 "voxweave[all]"       # core + whisper (everything)
+# NVIDIA / Linux:
+uv tool install --torch-backend=cu128 "voxweave[cuda]"   # full pipeline + faster-whisper hybrid
+# Apple Silicon / macOS:
+uv tool install "voxweave[mps]"                          # full pipeline, Qwen-only
 ```
 
 The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
 Japanese/CJK), layout, song-skip — plus CJK line-break and translation are baked into the
-**core dependencies**, so a bare `uv tool install voxweave` already works out of the box.
-`voxweave[qwen]` is a no-op back-compat alias for the same core; `[whisper]` adds the
-faster-whisper hybrid engine and `[all]` = core + whisper.
+**core dependencies**. The variant selects the compute platform **and the ASR/alignment backend**:
+- `[cuda]` (NVIDIA/Linux): the in-process PyTorch Qwen3-ASR + forced aligner (`qwen-asr`), GPU
+  onnxruntime (CUDAExecutionProvider for MMS alignment), and the faster-whisper hybrid engine.
+- `[mps]` (Apple Silicon/macOS): **ASR** runs on the native MLX Qwen3-ASR from
+  [`mlx-audio`](https://github.com/Blaizzy/mlx-audio) (Metal kernels + quantization). **Alignment**
+  keeps the same per-language stack as `[cuda]`: English on wav2vec2 CTC (torch, runs on MPS;
+  the forced-align DP falls to CPU as torchaudio has no Metal kernel), Japanese/CJK on the ONNX
+  MMS aligner (CoreML/CPU — onnxruntime has no Metal provider). Only the Qwen fallback (zh·yue,
+  or any CTC failure) is served by the MLX Qwen3-ForcedAligner, since the torch `qwen-asr` aligner
+  is absent here. Vocal separation (MelBandRoformer) + PANNs song-skip stay on torch-MPS;
+  faster-whisper is omitted (ctranslate2 has no Metal backend). `qwen-asr` is excluded because its
+  `transformers==4.57.6` pin conflicts with mlx-audio, so `[cuda]` and `[mps]` are mutually
+  exclusive — pick one per host.
 
 **From source** (for development or pulling new code):
 
 ```bash
-make install        # = uv tool install --torch-backend=cu128 ".[all]"
-make reinstall      # after pulling new code
+make cuda          # NVIDIA/Linux  — uv tool install --torch-backend=cu128 ".[cuda]"
+make mps           # Apple Silicon — force-reinstall ".[mps]" (always picks up new source)
+make reinstall     # after pulling new code (honours VARIANT, default cuda)
 make uninstall
 ```
 
@@ -123,12 +140,16 @@ make uninstall
 - The core pulls `qwen-asr` (hard-pins `transformers==4.57.6` + `accelerate==1.12.0`) + a
   pure-torch Mel-Band Roformer vendored in `voxweave.vendor` (**no onnx/onnxruntime** —
   `audio-separator` is intentionally avoided because it eagerly imports onnxruntime at the
-  top level) + MMS-300m forced aligner (`ctc-forced-aligner` + `onnxruntime-gpu`) + layout
-  (`pysbd`) + song-skip (`panns-inference`) + CJK break (`budoux` + `jieba`) + translation (`openai`).
-- The only extras left are **`[whisper]`** (adds faster-whisper) and **`[all]`** (= core +
-  `[whisper]`). `[qwen]` remains as a no-op back-compat alias.
-- Slim install without the whisper engine: `make install EXTRAS=qwen`.
-- **Development**: `make dev` (= `uv sync --all-extras --dev`).
+  top level) + MMS-300m forced aligner (`ctc-forced-aligner`) + layout (`pysbd`) + song-skip
+  (`panns-inference`) + CJK break (`budoux` + `jieba`) + translation (`openai`).
+- **`[cuda]`** (NVIDIA/Linux): `qwen-asr` + `onnxruntime-gpu` + `faster-whisper`. **`[mps]`**
+  (Apple Silicon/macOS): `mlx-audio` + plain `onnxruntime`. Declared **conflicting** in
+  `[tool.uv]` (incompatible `transformers` pins), so `uv` resolves each in its own fork — pick one
+  per host (`make dev VARIANT=mps` on Apple Silicon).
+- The device is auto-detected at runtime (cuda → mps → cpu); override with `VOXWEAVE_DEVICE`. On
+  mps the MLX backend is selected automatically; force it either way with `VOXWEAVE_BACKEND=mlx|torch`.
+- **Development**: `make dev` (= `uv sync --extra cuda --dev`; on Apple Silicon use
+  `make dev VARIANT=mps` — `[cuda]`/`[mps]` are conflicting extras and can't be synced together).
 
 </details>
 
@@ -302,11 +323,17 @@ default config is written on first run (migrated automatically from a pre-rename
 
 - `VOXWEAVE_ASR_MODEL` (default `Qwen/Qwen3-ASR-0.6B`; same as `--model`)
 - `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
-- `VOXWEAVE_DEVICE` (default `cuda:0`)
+- `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
+- `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
+- `VOXWEAVE_OFFLINE` (`1` to enable) — once all models are cached, sets `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` so loading skips the per-file HEAD revalidation + optional-file probing huggingface_hub/transformers otherwise do on every run (no network on a cache hit). Leave off for the first download.
+- `VOXWEAVE_MLX_ASR_REPO` / `VOXWEAVE_MLX_ALIGNER_REPO` — MLX backend repos. By default the ASR repo
+  tracks `--model` size (`--model 1.7b` → `mlx-community/Qwen3-ASR-1.7B-8bit`); set `VOXWEAVE_MLX_ASR_REPO`
+  to hard-pin a specific quant (e.g. a 4-bit build) regardless of `--model`.
 
-All model weights are cached under `~/.cache/huggingface/hub` (auto-downloaded on first use), so a
-container only needs to bind-mount that one directory. Each model exposes an env override to swap
-the HF repo, or to point at an explicit local file (which, if it exists, skips the HF download):
+All model weights (torch + MLX) are cached under `~/.cache/voxweave/{asr,align,audio}`
+(auto-downloaded on first use; override the root with `VOXWEAVE_CACHE_ROOT`), so a container only
+needs to bind-mount that one directory. Each model exposes an env override to swap the HF repo, or
+to point at an explicit local file (which, if it exists, skips the HF download):
 
 - `VOXWEAVE_SEPARATOR_REPO` / `VOXWEAVE_SEPARATOR_REPO_FILE` (default `KimberleyJSN/melbandroformer` /
   `MelBandRoformer.ckpt`), or `VOXWEAVE_SEPARATOR_CKPT` / `VOXWEAVE_SEPARATOR_CONFIG` for explicit
@@ -357,7 +384,7 @@ qwen    = "Qwen/Qwen3-ASR-1.7B"          # punctuation model; must emit punctuat
 # Per-language forced-alignment model. Key = ISO-639-1 code; unlisted languages use Qwen3-ForcedAligner.
 # Values:
 #   "mms"   — MMS-300m + uroman, full-file single pass (immune to per-cue drift; the gold standard).
-#   HF id   — wav2vec2 CTC via HF transformers; weights land in ~/.cache/huggingface/hub (per-cue crop).
+#   HF id   — wav2vec2 CTC via HF transformers; weights land in ~/.cache/voxweave/align (per-cue crop).
 #   bundle  — torchaudio bundle name, e.g. "WAV2VEC2_ASR_LARGE_LV60K_960H" (same model, cached in ~/.cache/torch).
 #   ""      — explicitly fall back to Qwen for that language.
 [align]

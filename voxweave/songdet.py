@@ -19,6 +19,12 @@ SR = 32000
 PANNS_CKPT = os.path.expanduser(os.environ.get("VOXWEAVE_PANNS_CKPT", ""))
 PANNS_REPO = os.environ.get("VOXWEAVE_PANNS_REPO", "thelou1s/panns-inference")
 PANNS_REPO_FILE = os.environ.get("VOXWEAVE_PANNS_REPO_FILE", "Cnn14_mAP=0.431.pth")
+# panns_inference.config reads ~/panns_data/class_labels_indices.csv at import time; canonical source.
+PANNS_LABELS_FILE = "class_labels_indices.csv"
+PANNS_LABELS_URL = os.environ.get(
+    "VOXWEAVE_PANNS_LABELS_URL",
+    "https://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv",
+)
 
 # AudioSet class indices (class_labels_indices.csv)
 IDX_SPEECH = [0, 4, 6, 7]  # Speech, Conversation, Babbling, Speech synthesizer
@@ -58,9 +64,38 @@ def _resolve_panns_ckpt() -> str:
     return hf_hub_download(PANNS_REPO, PANNS_REPO_FILE, cache_dir=config.AUDIO_CACHE)
 
 
+def _ensure_panns_labels() -> None:
+    """Pre-place ~/panns_data/class_labels_indices.csv so importing panns_inference never shells out
+    to `wget` (its config.py wgets this file at import time — wget is absent on macOS). Pulls from the
+    same HF repo as the checkpoint when available, else the canonical AudioSet URL via urllib."""
+    dst = Path.home() / "panns_data" / PANNS_LABELS_FILE
+    if dst.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:  # prefer HF (cached under AUDIO_CACHE, same source as the checkpoint)
+        import shutil
+
+        from huggingface_hub import hf_hub_download
+
+        src = hf_hub_download(
+            PANNS_REPO, PANNS_LABELS_FILE, cache_dir=config.AUDIO_CACHE
+        )
+        shutil.copyfile(src, dst)
+        return
+    except Exception:  # noqa: BLE001 -- repo may not host the csv; fall back to the canonical URL
+        pass
+    import urllib.request
+
+    with urllib.request.urlopen(PANNS_LABELS_URL) as r:  # noqa: S310 -- fixed trusted host
+        data = r.read()
+    dst.write_bytes(data)
+    log.info("downloaded PANNs labels -> %s", dst)
+
+
 def _get_model():
     global _model
     if _model is None:
+        _ensure_panns_labels()  # must precede the import: panns_inference.config reads the csv eagerly
         import torch
         from panns_inference import AudioTagging
 

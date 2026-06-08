@@ -1,38 +1,49 @@
-.PHONY: install reinstall whisper uninstall dev test lint
+.PHONY: install reinstall cuda mps uninstall dev test lint
 
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
-# The full local pipeline (separation / ASR / forced alignment / layout / song-skip), CJK
-# line-break, and translation are baked into the core deps, so a bare `uv tool install voxweave`
-# already works. Default EXTRAS=all additionally pulls the faster-whisper hybrid engine
-# (--model large-v3*). Slim install without whisper: make install EXTRAS=qwen
-#   (qwen is a no-op alias kept for back-compat; the core already contains it).
-# torch wheel is pinned to the Blackwell sm_120 cu128 build (no GPU auto-detect) and
-# installed into the same isolated tool venv (a bare `uv pip` cannot reach that venv).
-EXTRAS ?= all
+# The separation / layout / song-skip / CJK-break / translation pipeline is baked into the core
+# deps; the install variant selects the compute platform AND the ASR/alignment backend:
+#   VARIANT=cuda (default) -> NVIDIA/Linux: torch Qwen3-ASR+aligner (qwen-asr) + onnxruntime-gpu +
+#                             faster-whisper, on the cu128 torch wheel (Blackwell sm_120, no auto-detect)
+#   VARIANT=mps            -> Apple Silicon/macOS: native MLX Qwen3-ASR+aligner (mlx-audio) on the
+#                             default torch wheel (MPS built in for the separator; no whisper engine)
+# Convenience targets: `make cuda` / `make mps` == `make install VARIANT=<x>`.
+# Everything lands in an isolated uv tool venv (a bare `uv pip` cannot reach that venv).
+# Override the torch index per-invocation if needed, e.g. CPU-only: make install TORCH_BACKEND=cpu
+VARIANT ?= cuda
+
+ifeq ($(VARIANT),mps)
+  TORCH_BACKEND ?= auto
+else
+  TORCH_BACKEND ?= cu128
+endif
 
 install:
-	uv tool install --force --torch-backend=cu128 ".[$(EXTRAS)]"
+	uv tool install --force --torch-backend=$(TORCH_BACKEND) ".[$(VARIANT)]"
 	@voxweave --version
 	@git diff --quiet 2>/dev/null && echo "installed (git $$(git rev-parse --short HEAD))" || echo "installed (git $$(git rev-parse --short HEAD), uncommitted changes present)"
 
+# Platform shorthands.
+cuda:
+	$(MAKE) install VARIANT=cuda
+
+mps:
+	$(MAKE) install VARIANT=mps
+
 # Force reinstall after pulling new code.
 reinstall:
-	uv tool install --force --reinstall --torch-backend=cu128 ".[$(EXTRAS)]"
+	uv tool install --force --reinstall --torch-backend=$(TORCH_BACKEND) ".[$(VARIANT)]"
 	@voxweave --version
 	@git diff --quiet 2>/dev/null && echo "reinstalled (git $$(git rev-parse --short HEAD))" || echo "reinstalled (git $$(git rev-parse --short HEAD), uncommitted changes present)"
-
-# EXTRAS=all already includes whisper; this target is only needed if you used a slim
-# EXTRAS (e.g. EXTRAS=qwen) and want to add [whisper] on top
-# (pulls faster-whisper + ctranslate2 + PyAV; whisper weights auto-download on first use).
-whisper:
-	$(MAKE) install EXTRAS=$(EXTRAS),whisper
 
 uninstall:
 	uv tool uninstall voxweave
 
-# Development environment (for code changes, matches CI).
+# Development environment (for code changes, matches CI). [cuda] and [mps] are mutually
+# exclusive (conflicting transformers pins), so sync exactly one — defaults to cuda; on Apple
+# Silicon use: make dev VARIANT=mps
 dev:
-	uv sync --all-extras --dev
+	uv sync --extra $(VARIANT) --dev
 
 # Unit tests (no network).
 test:
