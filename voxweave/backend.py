@@ -1240,13 +1240,27 @@ def _resolve_mms_onnx() -> str:
     return _hf_download(MMS_REPO, MMS_REPO_FILE, cache_dir=config.ALIGN_CACHE)
 
 
+def _mms_providers(dev: str) -> list[str]:
+    """ONNX execution providers for the MMS aligner, by resolved device.
+
+    CUDA build: GPU provider first (onnxruntime-gpu — the CPU onnxruntime is dropped on Linux via
+    [tool.uv] so it can't shadow it), CPU fallback. Everything else — including macOS/MPS — runs on
+    CPU. CoreML is deliberately NOT used on macOS: its EP initializes a Metal context, and per-chunk
+    we already run MLX ASR on Metal in the same process, then MMS alignment; two independent Metal
+    backends coexisting hard-segfaults (signal 11 at the first MMS run). Plain CPU onnxruntime never
+    touches Metal, so it coexists with MLX safely — at the cost of CPU-bound alignment (a chunk's
+    MMS pass is still only a few seconds on Apple Silicon).
+    """
+    if dev.startswith("cuda"):
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
 def _get_mms_aligner() -> CtcMms:
     """Lazy-load MMS-300m ONNX session + tokenizer singleton, cleared on release().
 
-    Same model as whisperx --align_backend ctc. Picks the ONNX execution provider from the
-    resolved device: CUDA on the [cuda] build (onnxruntime-gpu — the CPU onnxruntime is dropped
-    on Linux via [tool.uv] so it can't shadow the GPU build); CoreML when available on macOS/MPS
-    ([mps] build ships plain onnxruntime); CPU otherwise.
+    Same model as whisperx --align_backend ctc. Execution provider from the resolved device
+    (see _mms_providers): CUDA on the [cuda] build, CPU everywhere else (incl. macOS/MPS).
     """
     global _mms
     if _mms is None:
@@ -1256,15 +1270,7 @@ def _get_mms_aligner() -> CtcMms:
         except ModuleNotFoundError as e:
             raise _require(e.name or "ctc_forced_aligner") from e
         onnx_path = _resolve_mms_onnx()
-        dev = get_device()
-        avail = ort.get_available_providers()
-        if dev.startswith("cuda"):
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        elif dev == "mps" and "CoreMLExecutionProvider" in avail:
-            # CoreML EP falls back to CPU per-op for anything Metal can't run, so this is safe.
-            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
-        else:
-            providers = ["CPUExecutionProvider"]
+        providers = _mms_providers(get_device())
         so = ort.SessionOptions()
         so.log_severity_level = 3  # suppress CUDA Memcpy WARNINGs (advisory only)
         sess = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
@@ -1408,7 +1414,8 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
     Qwen3ForcedAligner. Languages with no CTC config go directly to Qwen.
 
     The CTC aligners run on every backend (wav2vec2 is torch -> MPS-capable; MMS is onnxruntime ->
-    CoreML/CPU on macOS), so English keeps its WhisperX-grade wav2vec2 alignment even on Apple
+    CUDA on Linux, CPU on macOS — CoreML is avoided as its Metal context segfaults alongside MLX,
+    see _mms_providers), so English keeps its WhisperX-grade wav2vec2 alignment even on Apple
     Silicon. Only the Qwen fallback differs: on the MLX backend the torch qwen-asr aligner is
     absent, so the native MLX Qwen3-ForcedAligner serves it instead.
     """

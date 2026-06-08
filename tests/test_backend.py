@@ -182,6 +182,28 @@ def test_uses_mms_ja_yes_en_no(monkeypatch):
     assert backend.uses_mms("zh") is False  # None (goes to Qwen)
 
 
+def test_mms_providers_cuda_uses_gpu():
+    # CUDA build: GPU provider first, CPU fallback.
+    assert backend._mms_providers("cuda") == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert backend._mms_providers("cuda:0") == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+
+
+def test_mms_providers_mps_uses_cpu_not_coreml():
+    # macOS/MPS: CPU only. CoreML is deliberately NOT selected -- its Metal context segfaults
+    # when it coexists with MLX (per-chunk MLX ASR + MMS align in one process).
+    assert backend._mms_providers("mps") == ["CPUExecutionProvider"]
+
+
+def test_mms_providers_cpu():
+    assert backend._mms_providers("cpu") == ["CPUExecutionProvider"]
+
+
 def test_align_text_routes_ja_to_mms(monkeypatch, tmp_path):
     # ja + config "mms" -> align_text routes to align_text_mms; align_text_ctc must not be called
     monkeypatch.setattr(
