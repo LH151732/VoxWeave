@@ -404,6 +404,9 @@ def transcribe(
             strategy=strategy,
             full_wav=wav,
             bounds=[(ch["start"], ch["end"]) for ch in chunks],
+            # post-excise speech segments on the separated wav: the CTC full pass
+            # soft-masks emissions outside these so words cannot park in music/silence
+            speech_spans=[(s["start"], s["end"]) for s in segs],
         )
         # reinject_punct runs after language resolution (tokenization must match iso),
         # so punctuation cannot be reinjected per-chunk.
@@ -825,6 +828,7 @@ def _align_blocks(
     crops: list[tuple[float, float] | None],
     reporter: Reporter,
     tmp_chunks: list[Path],
+    speech_spans: list[tuple[float, float]] | None = None,
 ) -> list[list[dict]]:
     """Route blocks to the configured aligner and return per-block units.
 
@@ -857,7 +861,12 @@ def _align_blocks(
     if ctc_model:  # en wav2vec2: windowed emission + single global DP (routing-free)
         reporter.task("full-file alignment (CTC)", 1)
         units = backend.align_blocks_full_ctc(
-            wav, [b["text"] for b in blocks], iso, ctc_model, bounds=bounds
+            wav,
+            [b["text"] for b in blocks],
+            iso,
+            ctc_model,
+            bounds=bounds,
+            speech_spans=speech_spans,
         )
         reporter.advance(1)
         return units
@@ -961,6 +970,9 @@ def align(
             crops=crops,
             reporter=rep,
             tmp_chunks=tmp_chunks,
+            # vad_speech persisted by transcribe (same media timeline): lets the CTC
+            # full pass mask non-speech emissions; absent/empty -> no masking
+            speech_spans=_spans_in(data.get("vad_speech")),
         )
 
         # Tight cropping eliminates "last word drifts into inter-sentence silence", so

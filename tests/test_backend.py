@@ -699,8 +699,15 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
     monkeypatch.setattr(backend.config, "align_model_for", lambda iso: "some-wav2vec2")
     seen = {}
 
-    def _full(wav, texts, iso, model, bounds=None):
-        seen.update(wav=wav, texts=texts, iso=iso, model=model, bounds=bounds)
+    def _full(wav, texts, iso, model, bounds=None, speech_spans=None):
+        seen.update(
+            wav=wav,
+            texts=texts,
+            iso=iso,
+            model=model,
+            bounds=bounds,
+            speech_spans=speech_spans,
+        )
         # absolute units, one per chunk
         return [
             [{"text": "hi", "start": 10.5, "end": 11.0}],
@@ -714,10 +721,17 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
     full = tmp_path / "full.wav"
     full.write_bytes(b"x")
     bounds = [(10.0, 120.0), (130.0, 240.0)]
+    spans = [(10.0, 60.0), (130.0, 200.0)]
     out = backend.transcribe_chunks(
-        wavs, None, asr_model="qwen3-asr-1.7b", full_wav=full, bounds=bounds
+        wavs,
+        None,
+        asr_model="qwen3-asr-1.7b",
+        full_wav=full,
+        bounds=bounds,
+        speech_spans=spans,
     )
     assert seen["wav"] is full and seen["bounds"] == bounds
+    assert seen["speech_spans"] == spans  # VAD spans reach the full-pass aligner
     assert seen["texts"] == ["hi there", "hi there"] and seen["iso"] == "en"
     # absolute -> chunk-relative: each chunk's units shifted by -bounds[i].start
     assert out[0][2] == [{"text": "hi", "start": 0.5, "end": 1.0}]

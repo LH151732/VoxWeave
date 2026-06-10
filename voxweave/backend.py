@@ -663,6 +663,7 @@ def _full_pass_units(
     bounds: Sequence[tuple[float, float]] | None,
     texts: list[str],
     align_lang: str | None,
+    speech_spans: list[tuple[float, float]] | None = None,
 ) -> list[list[dict]] | None:
     """Full-file alignment for CTC/MMS languages; None -> caller aligns per chunk.
 
@@ -696,7 +697,12 @@ def _full_pass_units(
             blocks = align_blocks_full_mms(full_wav, texts, iso, bounds=list(bounds))
         else:
             blocks = align_blocks_full_ctc(
-                full_wav, texts, iso, model_name, bounds=list(bounds)
+                full_wav,
+                texts,
+                iso,
+                model_name,
+                bounds=list(bounds),
+                speech_spans=speech_spans,
             )
     except Exception as e:  # noqa: BLE001 -- any failure falls back to per-chunk alignment
         log.warning(
@@ -717,6 +723,7 @@ def transcribe_chunks(
     strategy: str = "peak",
     full_wav: Path | None = None,
     bounds: list[tuple[float, float]] | None = None,
+    speech_spans: list[tuple[float, float]] | None = None,
 ) -> list[tuple[str | None, str, list[dict]]]:
     """Transcribe a list of chunks -> [(lang, text, units)] matching the transcribe_align contract.
 
@@ -761,10 +768,18 @@ def transcribe_chunks(
         # pass C: align both texts (whisper units carry the timing; Qwen units only
         # position punctuation), full-file where the language allows, then merge
         full_w = _full_pass_units(
-            full_wav, bounds, [t for _, t, _ in w_asr], _weighted_align_lang(w_asr)
+            full_wav,
+            bounds,
+            [t for _, t, _ in w_asr],
+            _weighted_align_lang(w_asr),
+            speech_spans=speech_spans,
         )
         full_q = _full_pass_units(
-            full_wav, bounds, [t for _, t, _ in q_asr], _weighted_align_lang(q_asr)
+            full_wav,
+            bounds,
+            [t for _, t, _ in q_asr],
+            _weighted_align_lang(q_asr),
+            speech_spans=speech_spans,
         )
         out: list[tuple[str | None, str, list[dict]]] = []
         for i, (w, (dw, tw, aw), (dq, tq, aq)) in enumerate(
@@ -792,7 +807,11 @@ def transcribe_chunks(
     if release:
         _release_whisper() if engine == "whisper" else _release_qwen_asr()
     full_units = _full_pass_units(
-        full_wav, bounds, [t for _, t, _ in asr_out], _weighted_align_lang(asr_out)
+        full_wav,
+        bounds,
+        [t for _, t, _ in asr_out],
+        _weighted_align_lang(asr_out),
+        speech_spans=speech_spans,
     )
     out2: list[tuple[str | None, str, list[dict]]] = []
     for i, (w, (det, text, align_lang)) in enumerate(zip(wav_paths, asr_out)):
@@ -1043,6 +1062,51 @@ def _ctc_logp(al, wav):
         return torch.log_softmax(logits, dim=-1)  # [T,V]
 
 
+# Non-speech emission masking (stable-ts analogue): outside VAD speech spans, non-blank
+# log-probs are penalized so the global DP cannot park words inside music/silence — the
+# residual "Pattern A" tail slide on sparse-dialogue movies. Soft penalty (not -inf): a
+# VAD false negative can still be overridden by strong acoustic evidence. Spans are
+# dilated so VAD edge jitter never clips a word onset/coda. The star wildcard column is
+# built AFTER masking (max over non-blank), so it inherits the penalty and cannot claim
+# silence either; blanks fill the gaps.
+#
+# OPT-IN (VOXWEAVE_VAD_EMISSION_MASK=1), default off: A/B on real media showed the harm
+# case — transcribed vocalizations that VAD misses (humming "Pa-pa-pa") are real sounds
+# at real positions, and masking relocates them seconds away. The mechanism only wins
+# when out-of-VAD words are alignment ERRORS (the sparse-dialogue movie profile); enable
+# it for that profile, and validate against ground truth before trusting a new corpus.
+_VAD_MASK_PENALTY = 4.0
+_VAD_MASK_DILATE_S = 0.12
+
+
+def _mask_emissions_outside_speech(logp, speech_spans, total_samples, sr, blank):
+    """Penalize non-blank columns of [T,V] log-probs in frames outside speech spans.
+
+    ``speech_spans`` are seconds on the same timeline as the waveform that produced
+    ``logp`` (caller shifts chunk offsets). Empty/None spans return ``logp`` unchanged —
+    no VAD information must never mean "everything is silence"."""
+    import torch
+
+    if not speech_spans:
+        return logp
+    t_frames = logp.shape[0]
+    spf = total_samples / t_frames / sr  # seconds per frame (~0.02)
+    keep = torch.zeros(t_frames, dtype=torch.bool)
+    for s, e in speech_spans:
+        a = max(0, int((s - _VAD_MASK_DILATE_S) / spf))
+        b = min(t_frames, int((e + _VAD_MASK_DILATE_S) / spf) + 1)
+        if b > a:
+            keep[a:b] = True
+    if bool(keep.all()):
+        return logp
+    pen_row = torch.full((logp.shape[1],), _VAD_MASK_PENALTY, device=logp.device)
+    pen_row[blank] = 0.0
+    masked = logp.clone()
+    idx = (~keep).to(logp.device)
+    masked[idx] = masked[idx] - pen_row
+    return masked
+
+
 def _ctc_emit_full(al, wav):
     """Long waveform -> seamless [T,V] log-probs via windowed forward passes.
 
@@ -1170,17 +1234,27 @@ def _ctc_build_tokens(norm: list[str], nospace: bool, al):
 
 
 def _ctc_full_pass(
-    al, wav, norm: list[str], nospace: bool, iso: str
+    al,
+    wav,
+    norm: list[str],
+    nospace: bool,
+    iso: str,
+    speech_spans: list[tuple[float, float]] | None = None,
 ) -> list[list[dict]]:
     """One windowed-emission + global forced_align over `wav` for cue texts `norm`.
 
     Times are relative to the start of `wav` (caller offsets when `wav` is a chunk). Returns
     per-cue units in `norm` order; empty/wordless cues get []. The single DP is O(T*L).
+    ``speech_spans`` (seconds, wav-relative) soft-mask non-speech emissions before the DP.
     """
     toks, meta, words = _ctc_build_tokens(norm, nospace, al)
     if not words:
         return [[] for _ in norm]
     logp = _ctc_emit_full(al, wav)
+    if speech_spans:
+        logp = _mask_emissions_outside_speech(
+            logp, speech_spans, wav.shape[-1], al.sr, al.blank
+        )
     units = _ctc_align_logp(al, logp, toks, meta, words, nospace, wav.shape[-1])
     return _distribute_units(units, norm, iso)
 
@@ -1193,7 +1267,7 @@ def _dp_chunked_pass(
     pass_fn,
     label: str,
 ) -> list[list[dict]]:
-    """Run `pass_fn(wav_slice, texts) -> per-block units` under the global-DP memory budget.
+    """Run `pass_fn(wav_slice, texts, offset_s) -> per-block units` under the global-DP memory budget.
 
     Shared by the wav2vec2 and MMS full-pass aligners: both end in a single forced-align
     trellis that is O(T*L) and overflows on movie-length audio. Within budget the whole wav
@@ -1210,7 +1284,7 @@ def _dp_chunked_pass(
 
     frames = wav.shape[-1] / _CTC_STRIDE
     if frames <= CTC_MAX_DP_FRAMES:
-        return pass_fn(wav, norm)
+        return pass_fn(wav, norm, 0.0)
 
     if not bounds or len(bounds) != len(norm):
         raise RuntimeError(
@@ -1233,8 +1307,8 @@ def _dp_chunked_pass(
     for p in plans:
         a = max(0, int(p["start"] * sr))
         b = min(wav.shape[-1], int(p["end"] * sr))
-        sub = pass_fn(wav[a:b], norm[p["lo"] : p["hi"]])
         offset = a / sr
+        sub = pass_fn(wav[a:b], norm[p["lo"] : p["hi"]], offset)
         out.extend(shift_units(u, offset) for u in sub)
     return out
 
@@ -1245,6 +1319,7 @@ def align_blocks_full_ctc(
     iso: str,
     model_name: str,
     bounds: Sequence[tuple[float, float] | None] | None = None,
+    speech_spans: list[tuple[float, float]] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
 
@@ -1254,17 +1329,29 @@ def align_blocks_full_ctc(
     displaced into a 2.6s silence); inter-cue stars absorb untranscribed gaps (music/silence
     between cues) so the path never stretches a real word across a gap. Units are absolute
     timestamps relative to the full wav. Movie-length audio is DP-chunked at silence anchors
-    via cue `bounds` (see _dp_chunked_pass).
+    via cue `bounds` (see _dp_chunked_pass). ``speech_spans`` (VAD, absolute seconds)
+    soft-mask non-speech emissions so words cannot park in music/silence — opt-in via
+    VOXWEAVE_VAD_EMISSION_MASK=1 (see _mask_emissions_outside_speech for why).
     """
     from voxweave.realign import NO_SPACE_LANGS
 
+    if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
+        speech_spans = None
     al = _get_ctc_aligner(iso, model_name)
     nospace = iso in NO_SPACE_LANGS
     norm = [(t or "").strip() for t in texts]
     wav = _load_mono(wav_path, al.sr)
 
-    def _pass(w, sub: list[str]) -> list[list[dict]]:
-        out = _ctc_full_pass(al, w, sub, nospace, iso)
+    def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
+        spans_rel = None
+        if speech_spans:
+            end_s = offset_s + w.shape[-1] / al.sr
+            spans_rel = [
+                (max(0.0, s - offset_s), min(end_s, e) - offset_s)
+                for s, e in speech_spans
+                if e > offset_s and s < end_s
+            ]
+        out = _ctc_full_pass(al, w, sub, nospace, iso, speech_spans=spans_rel)
         _empty_cache()
         return out
 
@@ -1454,7 +1541,9 @@ def align_blocks_full_mms(
     wav = _read_wav_16k(wav_path)
     norm = [(t or "").strip() for t in texts]
 
-    def _pass(w, sub: list[str]) -> list[list[dict]]:
+    # offset_s is part of the _dp_chunked_pass pass_fn contract (used by the CTC
+    # path's emission masking); MMS does not mask yet, pending ja truth validation.
+    def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
         full = " ".join(t for t in sub if t)
         flat = _mms_emit_units(w, full, iso)
         _empty_cache()
