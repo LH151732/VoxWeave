@@ -365,6 +365,53 @@ def test_zh_len_break_avoids_dangling_de():
         assert not c["text"].endswith("的"), [x["text"] for x in cues]
 
 
+def test_force_break_boundaryless_overrun(monkeypatch):
+    # a single phrase atom spanning the whole text (no internal boundary) must
+    # still be cut once it exceeds the budget by FORCE_BREAK_FACTOR, instead of
+    # emitting one mega-line.
+    import voxweave.core.breakpoints as bp
+
+    class OnePhrase:
+        def parse(self, text):
+            return [text]
+
+    monkeypatch.setattr(bp, "_load_parser", lambda lang: OnePhrase())
+    seq = "あ" * 30
+    words = [
+        {"word": c, "start": i * 0.1, "end": i * 0.1 + 0.05} for i, c in enumerate(seq)
+    ]
+    cues = smart_split_segments(
+        [_seg(words, "ja")], "ja", speech_spans=None, thresholds=TH
+    )
+    assert len(cues) >= 2
+    assert "".join(c["text"] for c in cues) == seq
+    for c in cues:
+        assert len(c["text"]) <= 27 + 1  # 1.5 x 18-char budget (+1 carry atom)
+
+
+def test_unit_glyph_binds_to_digit():
+    # 92% is one atom: a phrase boundary or gap between 92 and % must never split it
+    from voxweave.core.smart_split import _build_atoms, _tokens
+
+    assert _tokens("上涨92%了", "zh") == ["上", "涨", "92%", "了"]
+    wd = [
+        {"start": i * 0.1, "end": i * 0.1 + 0.05} for i in range(5)
+    ]  # 上 涨 9 2 %
+    atoms = _build_atoms("上涨92%了", wd + [{"start": 0.5, "end": 0.55}], "zh")
+    a = next(x for x in atoms if x["text"] == "92%")
+    assert a["start"] == wd[2]["start"] and a["end"] == wd[4]["end"]
+
+
+def test_unit_glyph_wrap_units():
+    from voxweave.core.smart_split import _wrap_units
+
+    units = _wrap_units("営業利益92%です", "ja")
+    assert ("92%", "") in units
+    # a space between digit and glyph keeps them separate (text must rejoin exactly)
+    spaced = _wrap_units("92 %です", "ja")
+    assert ("92", " ") in spaced
+
+
 def test_phrase_boundary_atoms_in_atom_index_space():
     # unit regression: the boundary set must contain atom indices (all < len(atoms));
     # char offsets must not leak in (they can exceed len(atoms) when a Latin run is embedded)

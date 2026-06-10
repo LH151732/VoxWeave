@@ -177,13 +177,19 @@ def _join(words: List[str], lang: str) -> str:
     return "".join(words) if _no_spaces(lang) else " ".join(words)
 
 
+# Unit glyphs that bind to a preceding digit: 92|% must never split across cues
+# or lines. Covers halfwidth/fullwidth percent, permille, degree, temperature.
+_UNIT_GLYPHS = "%％‰°℃℉"
+
+
 def _tokens(text: str, lang: str) -> List[str]:
     """Tokenize for word-count alignment with ASR ``words`` entries.
 
     Space-delimited langs: ``text.split()``. CJK: each CJK char is one token;
     consecutive ASCII letters/digits/in-word punctuation (possibly with spaces
     between them) form one inseparable token. This keeps Latin phrases like
-    ``Building in a week`` atomic inside CJK text.
+    ``Building in a week`` atomic inside CJK text. A unit glyph (%/℃/...)
+    after a digit merges into that token so 92% stays one atom.
     """
     if not _no_spaces(lang):
         return text.split()
@@ -217,7 +223,13 @@ def _tokens(text: str, lang: str) -> List[str]:
         else:
             out.append(ch)
             i += 1
-    return out
+    merged: List[str] = []
+    for tok in out:
+        if merged and tok in _UNIT_GLYPHS and merged[-1][-1].isdigit():
+            merged[-1] += tok
+            continue
+        merged.append(tok)
+    return merged
 
 
 def _token_char_count(tok: str) -> int:
@@ -548,7 +560,7 @@ def split_at_sentence_end(
     cursor = 0
     # Content verification needs unit texts; legacy callers without a "word"
     # key keep the blind index cursor.
-    anchored = bool(word_data) and "word" in word_data[0] and not _no_spaces(lang)
+    anchored = bool(word_data) and "word" in word_data[0]
     for sent in sentences:
         for clause in split_sentence_heuristically(
             sent, max_line_length, max_lines, lang, split_at_comma, comma_split_min_len
@@ -558,13 +570,17 @@ def split_at_sentence_end(
                 continue
             clause_tokens = _tokens(clause, lang)
             if _no_spaces(lang):
-                # word_data is char-level for CJK; advance by non-space char count
+                # word_data is char-level for CJK; advance by non-space char count.
+                # Anchor on the same per-char granularity (reinject_punct emits one
+                # item per non-whitespace char, so units match chars 1:1).
                 wc = sum(_token_char_count(t) for t in clause_tokens)
+                anchor_tokens = [c for c in clause if not c.isspace()]
             else:
                 wc = len(clause_tokens)
+                anchor_tokens = clause_tokens
             start_at = cursor
-            if anchored and clause_tokens:
-                start_at, ok = _anchor_cursor(word_data, cursor, clause_tokens)
+            if anchored and anchor_tokens:
+                start_at, ok = _anchor_cursor(word_data, cursor, anchor_tokens)
                 if start_at != cursor or not ok:
                     log.warning(
                         "cue/word desync at %r: cursor %d -> %d (%s)",
@@ -720,6 +736,17 @@ def _classify_atom_break(
         split_subtitle(tentative, max_line_length, lang).count("\n") + 1 > max_lines
     )
     len_break = len_overflow and at_boundary
+    # Boundary-less overlong run (a single phrase atom exceeding the budget by
+    # 1.5x, e.g. a long katakana loan chain): bail out off-boundary rather than
+    # emit a mega-line — _best_len_break_pos still prefers any earlier legal
+    # boundary held in the running chunk.
+    if (
+        len_overflow
+        and not len_break
+        and _token_char_count(tentative)
+        > round(FORCE_BREAK_FACTOR * max_line_length * max_lines)
+    ):
+        len_break = True
     start0 = _span_start(cur)
     dur_break = (
         do_new
@@ -878,6 +905,7 @@ CHAIN_MAX_GAP_S = 0.5  # gaps below this are "dead zone" -> chain to 2 frames
 VISIBLE_GAP_MIN_S = 1.0  # gaps >= this stay a visible pause (BBC); not enforced in code (CHAIN_MAX_GAP_S=0.5 never reaches them)
 GLUE_MAX_GAP_S = 0.3  # lone-word flicker cue glues onto its nearer neighbor when that gap is below this
 LINGER_CAP_S = 1.0  # CPS-driven extension never lingers more than this past speech end
+FORCE_BREAK_FACTOR = 1.5  # boundary-less run may exceed the line budget by at most this before a forced cut
 
 
 @dataclass(frozen=True)
@@ -1203,6 +1231,16 @@ def _wrap_units(text: str, lang: str) -> List[Tuple[str, str]]:
             gap = " "
             while i < n and text[i].isspace():
                 i += 1
+        # a unit glyph directly after a digit joins it (92% never line-wraps apart);
+        # only when no gap intervenes — rejoining must reproduce the text exactly
+        if (
+            units
+            and atom in _UNIT_GLYPHS
+            and units[-1][1] == ""
+            and units[-1][0][-1].isdigit()
+        ):
+            prev_atom, _ = units.pop()
+            atom = prev_atom + atom
         units.append((atom, gap))
     return units
 

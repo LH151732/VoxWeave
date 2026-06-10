@@ -91,6 +91,37 @@ def test_unrecoverable_desync_warns_and_degrades(caplog):
     assert any("desync" in r.message for r in caplog.records)
 
 
+def _char_word_data(text, step=0.2, dur=0.1):
+    return [
+        {"word": c, "start": i * step, "end": i * step + dur}
+        for i, c in enumerate(c for c in text if not c.isspace())
+    ]
+
+
+def test_no_space_ghost_unit_resyncs():
+    # CJK pairing is per non-space char; a ghost unit prepended upstream shifts
+    # the stream by one. Content anchoring must resync instead of silently
+    # shifting every cue's timing.
+    text = "今日は。晴れ。"
+    word_data = _char_word_data("ん" + text)  # ghost ん at index 0
+    cues = split_at_sentence_end(text, word_data, "ja", 18, 1)
+    assert cues[0]["text"].startswith("今日")
+    # first real char 今 sits at unit index 1 -> start 0.2, not the ghost's 0.0
+    assert cues[0]["start"] == 0.2
+    for cue in cues:
+        chars = [w["word"] for w in cue["word_data"]]
+        assert chars == [c for c in cue["text"] if not c.isspace()]
+
+
+def test_no_space_clean_stream_pairs_exactly():
+    text = "今日は。晴れ。"
+    word_data = _char_word_data(text)
+    cues = split_at_sentence_end(text, word_data, "ja", 18, 1)
+    for cue in cues:
+        chars = [w["word"] for w in cue["word_data"]]
+        assert chars == [c for c in cue["text"] if not c.isspace()]
+
+
 def test_pipeline_split_accepts_vtt_path(tmp_path):
     # `voxweave split foo.vtt` should resolve the sibling JSON instead of
     # feeding WEBVTT bytes to json.loads.
