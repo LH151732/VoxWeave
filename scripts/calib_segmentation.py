@@ -178,6 +178,47 @@ def extract_commercial_en(mkv: Path) -> list[dict[str, Any]] | None:
 # ---------------------------------------------------------------------------
 
 
+NETFLIX_MIN_S = 5.0 / 6.0  # Netflix minimum display duration
+
+
+def _tail_token(text: str, iso: str) -> str:
+    """Trailing word of a cue for line-end quality scoring.
+
+    Spaced langs: last whitespace token. No-space langs: last phrase atom
+    (jieba word / BudouX phrase) of the last whitespace run — line_end_penalty
+    needs whole-word semantics for zh.
+    """
+    from voxweave.core.breakpoints import phrase_atoms  # noqa: PLC0415
+
+    parts = text.replace("\n", " ").split()
+    if not parts:
+        return ""
+    tail = parts[-1]
+    if iso in {"zh", "ja", "th", "lo", "my"}:
+        atoms = phrase_atoms(tail, iso)
+        if atoms:
+            tail = atoms[-1]
+    return tail
+
+
+def forbidden_end_rate(cues: list[dict[str, Any]], iso: str) -> float | None:
+    """Share of internal cue boundaries whose left cue ends on a forward-binding
+    token (line_end_penalty >= 2: en the/of/and..., zh 的/把/被..., ja のをにへ).
+
+    Punctuation is stripped from cue text, so legitimate sentence-final function
+    words inflate this slightly — read it as a relative gauge between runs."""
+    from voxweave.core.kinsoku import line_end_penalty  # noqa: PLC0415
+
+    if len(cues) < 2:
+        return None
+    bad = 0
+    for c in cues[:-1]:
+        tail = _tail_token(c.get("text", ""), iso)
+        if tail and line_end_penalty(tail, iso) >= 2:
+            bad += 1
+    return bad / (len(cues) - 1)
+
+
 def cue_metrics(cues: list[dict[str, Any]], iso: str) -> dict[str, Any]:
     """Compute per-episode metrics for a cue list."""
     n = len(cues)
@@ -189,11 +230,15 @@ def cue_metrics(cues: list[dict[str, Any]], iso: str) -> dict[str, Any]:
             "dur_max": 0.0,
             "over7s": 0,
             "under05s": 0,
+            "under_min": 0,
             "cps_med": 0.0,
+            "cps_p90": 0.0,
+            "bad_end": None,
         }
     durs = [c["end"] - c["start"] for c in cues]
     over7 = sum(1 for d in durs if d > 7.0)
     under05 = sum(1 for d in durs if d < 0.5)
+    under_min = sum(1 for d in durs if d < NETFLIX_MIN_S)
     # CPS: chars per second; for CJK, len = char count (no spaces)
     cps_vals: list[float] = []
     for c, d in zip(cues, durs):
@@ -209,12 +254,26 @@ def cue_metrics(cues: list[dict[str, Any]], iso: str) -> dict[str, Any]:
         "dur_max": max(durs),
         "over7s": over7,
         "under05s": under05,
+        "under_min": under_min,
         "cps_med": percentile(cps_vals, 50) if cps_vals else 0.0,
+        "cps_p90": percentile(cps_vals, 90) if cps_vals else 0.0,
+        "bad_end": forbidden_end_rate(cues, iso),
     }
 
 
+def _cue_stream_text(cues: list[dict[str, Any]]) -> str:
+    """Concatenated cue text with whitespace removed.
+
+    Phrase-boundary offsets MUST be computed over this exact stream: cue text has
+    punctuation stripped to spaces, so offsets derived from the punctuation-bearing
+    word_segments text would desync at every former punctuation mark."""
+    return "".join(
+        c.get("text", "").replace(" ", "").replace("\n", "") for c in cues
+    )
+
+
 def mid_phrase_cut_rate(
-    cues: list[dict[str, Any]], iso: str, full_text_nospace: str
+    cues: list[dict[str, Any]], iso: str, full_text_nospace: str | None = None
 ) -> float | None:
     """Return combined mid-phrase-cut rate [0,1] for CJK cues using BudouX.
 
@@ -227,6 +286,7 @@ def mid_phrase_cut_rate(
     if iso not in no_space_langs:
         return None
 
+    full_text_nospace = _cue_stream_text(cues)
     if not full_text_nospace:
         return None
 
@@ -258,7 +318,7 @@ def mid_phrase_cut_rate(
 def mid_phrase_cut_split(
     cues: list[dict[str, Any]],
     iso: str,
-    full_text_nospace: str,
+    full_text_nospace: str | None,
     offline_s: float,
 ) -> dict[str, Any] | None:
     """Classify each internal boundary as gap-break or len-break, then measure
@@ -289,6 +349,7 @@ def mid_phrase_cut_split(
     if iso not in no_space_langs:
         return None
 
+    full_text_nospace = _cue_stream_text(cues)
     if not full_text_nospace or len(cues) < 2:
         return None
 
@@ -391,20 +452,28 @@ def run_episode(
     if not word_segments:
         return {"error": "empty word_segments"}
 
+    from voxweave import realign  # noqa: PLC0415
     from voxweave.core.smart_split import smart_split_segments  # noqa: PLC0415
     from voxweave.config import gap_thresholds  # noqa: PLC0415
 
+    # Mirror the production path: zh punctuation snapped to jieba word boundaries.
+    word_segments = realign.snap_break_punct(word_segments, iso)
     seg = build_segment(word_segments, iso)
+
+    # vad_speech persisted by transcribe (newer JSONs); older JSONs degrade to offline_ms.
+    speech_spans = data.get("vad_speech") or None
+    if speech_spans:
+        speech_spans = [(float(s), float(e)) for s, e in speech_spans]
 
     # OLD: no thresholds, legacy length-only path
     old_cues = smart_split_segments([seg], iso)
 
-    # NEW: gap-aware; speech_spans=None (JSON predates vad_speech; offline degrade)
+    # NEW: gap-aware
     th = gap_thresholds(iso)
     new_cues = smart_split_segments(
         [seg],
         iso,
-        speech_spans=None,
+        speech_spans=speech_spans,
         thresholds=th,
     )
 
@@ -483,7 +552,13 @@ def print_episode_table(name: str, r: dict[str, Any]) -> None:
     row("dur max (s)", "dur_max")
     row_int(">7s cues", "over7s")
     row_int("<0.5s cues", "under05s")
+    row_int("<5/6s cues", "under_min")
     row("CPS median", "cps_med")
+    row("CPS p90", "cps_p90")
+    o_be = fmt_mpc(old.get("bad_end"))
+    n_be = fmt_mpc(new.get("bad_end"))
+    e_be = fmt_mpc(en.get("bad_end")) if en else "         N/A"
+    print(f"  {'bad line-end %':<28} {o_be:>10} {n_be:>10} {e_be:>12}")
 
     print(f"  {'─' * 28} {'─' * 10} {'─' * 10} {'─' * 12}")
     # OLD: combined mid-phrase-cut %
@@ -515,20 +590,31 @@ def print_episode_table(name: str, r: dict[str, Any]) -> None:
         print(f"  {'  mid-phrase split':<28} {'':>10} {'   N/A':>10} {'':>12}")
 
 
+_MEDIA_EXTS = {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".avi", ".ts"}
+
+
+def _sibling_json(media: Path) -> Path:
+    """Sibling .json path, replacing only the trailing extension (never
+    Path.with_suffix on interior-dot names — same contract as pipeline._swap_ext)."""
+    return media.with_name(media.name[: -len(media.suffix)] + ".json")
+
+
 def main(video_dir: str) -> None:
     d = Path(video_dir)
-    mkv_files = sorted(d.glob("*.mkv"))
+    mkv_files = sorted(
+        p for p in d.iterdir() if p.is_file() and p.suffix.lower() in _MEDIA_EXTS
+    )
 
     if not mkv_files:
-        print(f"No .mkv files found in {video_dir}", file=sys.stderr)
+        print(f"No media files found in {video_dir}", file=sys.stderr)
         sys.exit(1)
 
     print("\nCalibration harness: gap-aware segmentation")
     print(f"Directory : {video_dir}")
-    print(f"Episodes  : {len(mkv_files)} MKV files found")
+    print(f"Episodes  : {len(mkv_files)} media files found")
     print(
-        "Note: speech_spans=None (JSONs predate vad_speech persistence)"
-        " => NEW uses offline_ms degrade path."
+        "Note: speech_spans comes from the JSON's vad_speech when present;"
+        " older JSONs degrade to the offline_ms path."
     )
 
     agg: dict[str, list] = {
@@ -547,6 +633,12 @@ def main(video_dir: str) -> None:
         "old_cps_med": [],
         "new_cps_med": [],
         "en_cps_med": [],
+        "old_bad_end": [],
+        "new_bad_end": [],
+        "en_bad_end": [],
+        "old_under_min": [],
+        "new_under_min": [],
+        "en_under_min": [],
         "old_mpc": [],
         # NEW split metrics
         "new_len_mid_pct": [],
@@ -557,7 +649,7 @@ def main(video_dir: str) -> None:
     errors: list[str] = []
 
     for mkv in mkv_files:
-        json_path = mkv.with_suffix(".json")
+        json_path = _sibling_json(mkv)
         if not json_path.exists():
             continue
 
@@ -595,6 +687,16 @@ def main(video_dir: str) -> None:
         agg["new_cps_med"].append(r["new"]["cps_med"])
         if r["en"]:
             agg["en_cps_med"].append(r["en"]["cps_med"])
+        if r["old"].get("bad_end") is not None:
+            agg["old_bad_end"].append(r["old"]["bad_end"])
+        if r["new"].get("bad_end") is not None:
+            agg["new_bad_end"].append(r["new"]["bad_end"])
+        if r["en"] and r["en"].get("bad_end") is not None:
+            agg["en_bad_end"].append(r["en"]["bad_end"])
+        agg["old_under_min"].append(r["old"]["under_min"])
+        agg["new_under_min"].append(r["new"]["under_min"])
+        if r["en"]:
+            agg["en_under_min"].append(r["en"]["under_min"])
         if r.get("old_mpc") is not None:
             agg["old_mpc"].append(r["old_mpc"])
         split = r.get("new_mpc_split")
@@ -661,6 +763,24 @@ def main(video_dir: str) -> None:
     print(
         f"  {'mean(CPS median)':<34} {mean_old_cps:>10.2f} {mean_new_cps:>10.2f}"
         f" {f'{mean_en_cps:.2f}' if mean_en_cps is not None else 'N/A':>12}"
+    )
+
+    total_old_um = agg_sum(agg["old_under_min"])
+    total_new_um = agg_sum(agg["new_under_min"])
+    total_en_um = agg_sum(agg["en_under_min"]) if agg["en_under_min"] else None
+    print(
+        f"  {'total <5/6s cues':<34} {total_old_um:>10} {total_new_um:>10}"
+        f" {str(total_en_um) if total_en_um is not None else 'N/A':>12}"
+    )
+
+    mean_old_be = agg_mean(agg["old_bad_end"]) * 100 if agg["old_bad_end"] else None
+    mean_new_be = agg_mean(agg["new_bad_end"]) * 100 if agg["new_bad_end"] else None
+    mean_en_be = agg_mean(agg["en_bad_end"]) * 100 if agg["en_bad_end"] else None
+    print(
+        f"  {'mean bad line-end %':<34}"
+        f" {f'{mean_old_be:.1f}%' if mean_old_be is not None else 'N/A':>10}"
+        f" {f'{mean_new_be:.1f}%' if mean_new_be is not None else 'N/A':>10}"
+        f" {f'{mean_en_be:.1f}%' if mean_en_be is not None else 'N/A':>12}"
     )
 
     print(f"  {'─' * 34} {'─' * 10} {'─' * 10} {'─' * 12}")
