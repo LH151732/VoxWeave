@@ -62,3 +62,45 @@ def test_line_end_penalty_clean(text):
 
 def test_line_end_penalty_ignores_trailing_space():
     assert line_end_penalty("大樹の  ") == 2
+
+
+@pytest.mark.parametrize("tok", ["the", "The", "of", "and", "to", "with", "his", "was"])
+def test_line_end_penalty_en_forbidden(tok):
+    # en closed-class tokens must not end a line/cue (the | store)
+    assert line_end_penalty(tok, "en") == 2
+
+
+@pytest.mark.parametrize("tok", ["store", "went", "I", "yesterday", "GPT-4"])
+def test_line_end_penalty_en_content(tok):
+    assert line_end_penalty(tok, "en") == 0
+
+
+def test_line_end_penalty_en_strips_punct():
+    # trailing punctuation on the token must not hide the match
+    assert line_end_penalty("the,", "en") == 2
+
+
+def test_line_end_penalty_en_needs_lang():
+    # without lang, en tokens stay 0 (back-compat for legacy callers)
+    assert line_end_penalty("the") == 0
+
+
+@pytest.mark.parametrize("w", ["的", "地", "得", "把", "被", "和", "或", "而"])
+def test_line_end_penalty_zh_high(w):
+    assert line_end_penalty(w, "zh") == 2
+
+
+@pytest.mark.parametrize("w", ["在", "对", "很", "给"])
+def test_line_end_penalty_zh_med(w):
+    assert line_end_penalty(w, "zh") == 1
+
+
+@pytest.mark.parametrize("w", ["目的", "村庄", "数据中心", "大树"])
+def test_line_end_penalty_zh_whole_word(w):
+    # whole-word semantics: 目的 ends with 的 but is a noun — no penalty
+    assert line_end_penalty(w, "zh") == 0
+
+
+def test_line_end_penalty_ja_chars_active_without_lang():
+    # kana particle check stays active regardless of lang (cannot false-positive elsewhere)
+    assert line_end_penalty("大樹の", "ja") == 2

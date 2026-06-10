@@ -252,6 +252,119 @@ def test_best_len_break_pos_greedy_when_no_penalty():
     assert _best_len_break_pos(cur, bnd, at_boundary_next=True) == len(cur)
 
 
+def test_en_len_break_avoids_forbidden_token():
+    # en wiring of the Level-1 scorer: a length overflow must not strand a
+    # closed-class token (the/to/of) at cue end; the pen-0 candidate wins.
+    from voxweave.core.smart_split import (
+        SplitThresholds,
+        split_long_cues_with_word_timings,
+    )
+
+    words = "I went to the store".split()
+    wd = [{"start": i * 0.3, "end": i * 0.3 + 0.2} for i in range(len(words))]
+    cue = {"text": "I went to the store", "start": 0.0, "end": 1.7, "word_data": wd}
+    out = split_long_cues_with_word_timings(
+        [cue],
+        max_line_length=14,
+        max_lines=1,
+        min_duration=0.0,
+        desired_wps=4.0,
+        lang="en",
+        thresholds=SplitThresholds(min_cue_s=0.0),
+    )
+    assert len(out) >= 2
+    for c in out:
+        assert c["text"].split()[-1].lower() not in {"the", "to", "of"}, out
+
+
+def test_en_danger_zone_gap_suppressed_after_forbidden_token():
+    # 0.6s VAD-confirmed hesitation right after "the" -> suppressed (would strand
+    # the article); the cue stays whole across the pause.
+    starts = [0.0, 0.25, 0.5, 1.3]
+    words = [
+        {"word": w, "start": s, "end": s + 0.2}
+        for w, s in zip("look at the house".split(), starts)
+    ]
+    spans = [(0.0, 0.7), (1.3, 1.5)]
+    cues = smart_split_segments(
+        [_seg(words, "en")], "en", speech_spans=spans, thresholds=TH
+    )
+    assert len(cues) == 1, [c["text"] for c in cues]
+
+
+def test_en_danger_zone_gap_splits_after_content_word():
+    # control: same 0.6s confirmed gap after a content word -> split fires.
+    starts = [0.0, 0.25, 0.5, 1.3]
+    words = [
+        {"word": w, "start": s, "end": s + 0.2}
+        for w, s in zip("we should stop now".split(), starts)
+    ]
+    spans = [(0.0, 0.7), (1.3, 1.5)]
+    cues = smart_split_segments(
+        [_seg(words, "en")], "en", speech_spans=spans, thresholds=TH
+    )
+    assert len(cues) == 2, [c["text"] for c in cues]
+
+
+def test_en_real_silence_still_splits_after_forbidden_token():
+    # >=vad_skip true pause beats line-end aesthetics, same rule as ja の.
+    starts = [0.0, 0.25, 0.5, 1.9]
+    words = [
+        {"word": w, "start": s, "end": s + 0.2}
+        for w, s in zip("look at the house".split(), starts)
+    ]
+    spans = [(0.0, 0.7), (1.9, 2.1)]
+    cues = smart_split_segments(
+        [_seg(words, "en")], "en", speech_spans=spans, thresholds=TH
+    )
+    assert len(cues) == 2, [c["text"] for c in cues]
+
+
+def test_zh_danger_zone_gap_suppressed_after_de():
+    # zh wiring: 0.6s confirmed gap after standalone 的 (attributive) -> suppressed.
+    pytest.importorskip("jieba")
+    seq = "大树的村庄"
+    starts = [0.0, 0.2, 0.4, 1.1, 1.3]  # 的 ends 0.5, 村 starts 1.1 -> gap 0.6
+    words = [{"word": c, "start": s, "end": s + 0.1} for c, s in zip(seq, starts)]
+    spans = [(0.0, 0.5), (1.1, 1.5)]
+    cues = smart_split_segments(
+        [_seg(words, "zh")], "zh", speech_spans=spans, thresholds=TH
+    )
+    joined = [c["text"] for c in cues]
+    assert not any(
+        a.endswith("的") and b.startswith("村") for a, b in zip(joined, joined[1:])
+    ), joined
+
+
+def test_zh_danger_zone_gap_splits_after_noun():
+    # control: gap after a noun word (penalty 0) -> split fires.
+    pytest.importorskip("jieba")
+    seq = "你好世界"
+    starts = [0.0, 0.2, 1.0, 1.2]  # 好 ends 0.3, 世 starts 1.0 -> gap 0.7
+    words = [{"word": c, "start": s, "end": s + 0.1} for c, s in zip(seq, starts)]
+    spans = [(0.0, 0.3), (1.0, 1.4)]
+    cues = smart_split_segments(
+        [_seg(words, "zh")], "zh", speech_spans=spans, thresholds=TH
+    )
+    assert len(cues) == 2, [c["text"] for c in cues]
+
+
+def test_zh_len_break_avoids_dangling_de():
+    # len overflow in zh must not end a cue on standalone 的.
+    pytest.importorskip("jieba")
+    seq = "美丽的村庄很漂亮"
+    words = [
+        {"word": c, "start": i * 0.2, "end": i * 0.2 + 0.1} for i, c in enumerate(seq)
+    ]
+    cues = smart_split_segments(
+        [_seg(words, "zh")], "zh", speech_spans=None, thresholds=TH, max_line_length=4
+    )
+    assert "".join(c["text"].replace(" ", "") for c in cues) == seq
+    assert len(cues) >= 2
+    for c in cues:
+        assert not c["text"].endswith("的"), [x["text"] for x in cues]
+
+
 def test_phrase_boundary_atoms_in_atom_index_space():
     # unit regression: the boundary set must contain atom indices (all < len(atoms));
     # char offsets must not leak in (they can exceed len(atoms) when a Latin run is embedded)

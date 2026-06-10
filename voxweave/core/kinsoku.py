@@ -33,12 +33,59 @@ _BIND_END_MED = frozenset(
     "とまでより"
 )  # と parallel/quotative, まで/より range: usually binds
 
+# zh equivalents, whole-word semantics (the caller passes the trailing *word*, so 目的/标的
+# never match — only the standalone particle/preposition does). Same high-precision policy
+# as ja: words with a common clause-final reading are excluded or demoted to MED.
+_ZH_BIND_END_HIGH = frozenset(
+    {
+        "的",  # attributive 的: standalone jieba token is virtually always the particle
+        "地",
+        "得",  # structural particles; standalone 得 (děi "must") also binds forward
+        "把",
+        "被",
+        "比",
+        "跟",  # prepositions: object always follows
+        "和",
+        "与",
+        "或",
+        "及",
+        "而",  # conjunctions: break goes before them, never after
+    }
+)
+_ZH_BIND_END_MED = frozenset(
+    {
+        # prepositions with occasional verb readings (他在/他对) — mild penalty only,
+        # so they bias len-break tie-breaks but never suppress a danger-zone gap split.
+        "在",
+        "对",
+        "从",
+        "向",
+        "往",
+        "给",
+        "让",
+        "由",
+        # degree adverbs that modify the following word
+        "很",
+        "太",
+        "更",
+        "最",
+    }
+)
 
-def line_end_penalty(text: str) -> int:
-    """Penalty for ending a line on the last char of ``text``.
+_EN_TOKEN_STRIP = ".,!?;:'\"”’"
 
-    0 = fine, 1 = mild (likely binds forward), 2 = bad (case/adnominal particle dangling).
-    Non-ja chars always score 0, so spaced languages and Latin runs are unaffected.
+
+def line_end_penalty(text: str, lang: str = "") -> int:
+    """Penalty for ending a line/cue on ``text`` (the trailing word or phrase).
+
+    0 = fine, 1 = mild (likely binds forward), 2 = bad (function word/particle dangling).
+
+    Signal source by language:
+    - ja (and default): last *char* against the kana particle tables — atoms are per-char,
+      and a particle is always the final char of its BudouX phrase. Always active: kana
+      can't false-positive in other scripts.
+    - en: whole token against breakpoints._FORBIDDEN_LEFT (articles/preps/aux/conj).
+    - zh: whole word (jieba token) against the zh particle/preposition tables.
     """
     s = text.rstrip()
     if not s:
@@ -48,6 +95,16 @@ def line_end_penalty(text: str) -> int:
         return 2
     if last in _BIND_END_MED:
         return 1
+    if lang == "en":
+        from .breakpoints import _FORBIDDEN_LEFT
+
+        if s.strip(_EN_TOKEN_STRIP).lower() in _FORBIDDEN_LEFT:
+            return 2
+    elif lang == "zh":
+        if s in _ZH_BIND_END_HIGH:
+            return 2
+        if s in _ZH_BIND_END_MED:
+            return 1
     return 0
 
 

@@ -296,10 +296,12 @@ def _phrase_boundary_atoms(atoms: List[dict], text: str, lang: str) -> set[int]:
 def _snap_mid_to_phrase_boundary(
     toks: List[str], text: str, lang: str, target: int
 ) -> int:
-    """Snap a midpoint index to the nearest BudouX phrase boundary.
+    """Snap a midpoint index to the best nearby phrase boundary.
 
     Raw ``mid = n//2`` can land inside a phrase (e.g. splitting です into で|す).
-    Falls back to ``target`` when the whole clause is a single phrase.
+    Among legal boundaries, prefer one whose left side does not end on a sticky
+    token (の/的/...), then the one nearest ``target``. Falls back to ``target``
+    when the whole clause is a single phrase.
     """
     atoms = [{"text": t} for t in toks]
     boundaries = sorted(_phrase_boundary_atoms(atoms, text, lang))
@@ -310,7 +312,14 @@ def _snap_mid_to_phrase_boundary(
     if not valid:
         # degenerate: whole clause is one BudouX phrase (no internal boundary) → midpoint
         return max(1, min(target, n - 1))
-    return min(valid, key=lambda b: abs(b - target))
+
+    def left_pen(b: int) -> int:
+        # penalty of the word ending just before the break: atoms from the last
+        # phrase start below b through b-1 (whole-word semantics for zh tables)
+        ws = max((x for x in boundaries if x < b), default=0)
+        return line_end_penalty("".join(toks[ws:b]), lang)
+
+    return min(valid, key=lambda b: (left_pen(b), abs(b - target)))
 
 
 def _is_ascii_run_char(c: str) -> bool:
@@ -574,6 +583,41 @@ def _gap_ms(prev_end: float | None, next_start: float | None) -> float | None:
     return gap if gap > 0 else None
 
 
+def _atom_end_pen(atom: dict) -> int:
+    """Line-end penalty for breaking after ``atom``.
+
+    Reads the precomputed ``end_pen`` (set by ``_attach_end_penalties``, which has
+    whole-word and lang context); falls back to the bare char-table score for
+    callers that pass raw atoms (unit tests, legacy paths)."""
+    pen = atom.get("end_pen")
+    return line_end_penalty(atom["text"]) if pen is None else pen
+
+
+def _attach_end_penalties(
+    atoms: List[dict], boundary: set[int] | None, lang: str
+) -> None:
+    """Precompute ``atom["end_pen"]`` — penalty for ending a cue/line on this atom.
+
+    Spaced langs (``boundary is None``): the atom is a whole word; score it directly
+    (en closed-class table). No-space langs: score the *word* — the atom span since
+    the last phrase boundary — so zh whole-word semantics hold (目的 never matches
+    的) and the ja kana check still reads the word's last char. Atoms a break cannot
+    legally follow (next atom mid-phrase) score 0; they are never candidates.
+    """
+    n = len(atoms)
+    word_start = 0
+    for k, a in enumerate(atoms):
+        if boundary is not None and k in boundary:
+            word_start = k
+        if boundary is None:
+            a["end_pen"] = line_end_penalty(a["text"], lang)
+        elif k + 1 >= n or (k + 1) in boundary:
+            word = "".join(x["text"] for x in atoms[word_start : k + 1])
+            a["end_pen"] = line_end_penalty(word, lang)
+        else:
+            a["end_pen"] = 0
+
+
 def _best_len_break_pos(
     cur: List[dict], cur_bnd: List[bool], at_boundary_next: bool
 ) -> int:
@@ -581,16 +625,16 @@ def _best_len_break_pos(
 
     Candidates: break before the incoming atom (pos n) and any internal
     phrase-start k (0<k<n). Pick the candidate whose left side ends with the
-    smallest sticky-particle penalty (line_end_penalty); ties go to the fullest
+    smallest sticky-token penalty (``end_pen``); ties go to the fullest
     line. Falls back to n (greedy) when no candidates exist.
     """
     n = len(cur)
     cands: List[tuple[int, int]] = []  # (penalty, split_pos)
     if at_boundary_next:
-        cands.append((line_end_penalty(cur[-1]["text"]), n))
+        cands.append((_atom_end_pen(cur[-1]), n))
     for k in range(1, n):
         if cur_bnd[k]:
-            cands.append((line_end_penalty(cur[k - 1]["text"]), k))
+            cands.append((_atom_end_pen(cur[k - 1]), k))
     if not cands:
         return n
     return min(cands, key=lambda pk: (pk[0], -pk[1]))[1]
@@ -601,7 +645,6 @@ def _classify_atom_break(
     atom: dict,
     *,
     at_boundary: bool,
-    has_boundary: bool,
     do_new: bool,
     th: SplitThresholds,
     speech_spans: list[tuple[float, float]] | None,
@@ -614,7 +657,7 @@ def _classify_atom_break(
     Pure: reads ``cur``/``atom``/thresholds, mutates nothing. All-False when ``cur`` is empty
     (the first atom of a chunk never breaks).
     - gap_break: a qualifying inter-atom pause, but only at a phrase boundary, and suppressed in
-      the clause_ms..vad_skip_ms zone when it would strand a sticky particle at line end.
+      the clause_ms..vad_skip_ms zone when it would strand a sticky token at line end.
     - dur_break: hard last-resort cap when the running cue would exceed ``max_cue_s`` (ignores
       word boundaries — intra-word spans over the cap are rare and an overlong cue is worse).
     - len_break: the line budget overflows AND this atom is a legal (phrase-start) break point.
@@ -639,8 +682,9 @@ def _classify_atom_break(
         )
     )
     # In the clause_ms..vad_skip_ms zone, suppress the gap-split if it would strand a sticky
-    # particle at line end (大樹の|村 → keep 大樹の村 together). True silence (>=vad_skip_ms) cuts.
-    if gap_break and has_boundary and line_end_penalty(prev["text"]) >= 2:
+    # token at line end: ja 大樹の|村, zh ...的|... , en a hesitation after "the". True
+    # silence (>=vad_skip_ms) always cuts — a real pause beats line-end aesthetics.
+    if gap_break and _atom_end_pen(prev) >= 2:
         gms = _gap_ms(prev.get("end"), atom.get("start"))
         if gms is not None and th.clause_ms <= gms < th.vad_skip_ms:
             gap_break = False
@@ -673,9 +717,8 @@ def _pack_atoms_into_chunks(
     """Greedily pack atoms into chunks, cutting on the first qualifying gap/dur/len break.
 
     Time-forced breaks (gap/dur) cut immediately; a length overflow picks the phrase-boundary
-    candidate with the smallest sticky-particle penalty via ``_best_len_break_pos`` (Level 1).
+    candidate with the smallest sticky-token penalty via ``_best_len_break_pos`` (Level 1).
     """
-    has_boundary = boundary is not None
     chunks: List[List[dict]] = []
     cur: List[dict] = []
     cur_bnd: List[
@@ -687,7 +730,6 @@ def _pack_atoms_into_chunks(
             cur,
             atom,
             at_boundary=at_boundary,
-            has_boundary=has_boundary,
             do_new=do_new,
             th=th,
             speech_spans=speech_spans,
@@ -754,6 +796,7 @@ def split_long_cues_with_word_timings(
             if do_new and _no_spaces(lang)
             else None
         )
+        _attach_end_penalties(atoms, boundary, lang)
         chunks = _pack_atoms_into_chunks(
             atoms,
             boundary=boundary,
