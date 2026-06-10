@@ -126,7 +126,7 @@ def _encode_flac(src_wav: Path, dst_flac: Path) -> None:
     )
 
 
-def _swap_ext(path: Path, new_ext: str) -> Path:
+def swap_ext(path: Path, new_ext: str) -> Path:
     """Replace the trailing extension of path with new_ext (include leading dot; "" removes it).
 
     Do NOT use ``Path.with_suffix`` for sibling paths: filenames with interior dots
@@ -143,7 +143,7 @@ def _find_sibling_media(ref: Path) -> Path | None:
     """Find the source media alongside ref by trying known extensions; return first match."""
     ref = Path(ref)
     for ext in MEDIA_EXTS:
-        cand = _swap_ext(ref, ext)
+        cand = swap_ext(ref, ext)
         if cand.exists():
             return cand
     return None
@@ -594,11 +594,11 @@ def _write_siblings(
     ``timestamps=True`` writes a timing line before each cue (word-level precision); cues
     missing start/end fall back to plain text. ``timestamps=False`` writes a plain-text
     edit draft for human editing before re-running ``align``. Both formats are accepted by
-    ``realign.parse_vtt_blocks``. Uses ``_swap_ext`` (not ``with_suffix``) to preserve
+    ``realign.parse_vtt_blocks``. Uses ``swap_ext`` (not ``with_suffix``) to preserve
     interior dots in filenames.
     """
     _dump_sibling_json(
-        _swap_ext(src, ".json"),
+        swap_ext(src, ".json"),
         language=lang,
         segments=cues,
         units=units,
@@ -613,7 +613,7 @@ def _write_siblings(
         )
         for c in cues
     ]
-    vtt_path = _swap_ext(src, ".vtt")
+    vtt_path = swap_ext(src, ".vtt")
     vtt_path.write_text(realign.render_cues(rows), encoding="utf-8")
     return vtt_path
 
@@ -719,7 +719,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
 
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
-    json_path = _swap_ext(Path(json_path), ".json")
+    json_path = swap_ext(Path(json_path), ".json")
     data = json.loads(json_path.read_text(encoding="utf-8"))
     units = data["word_segments"]
     iso = data.get("language", "en")
@@ -902,7 +902,7 @@ def align(
     """
     vtt_path = Path(vtt_path)
     rep = reporter or Reporter()
-    json_path = _swap_ext(vtt_path, ".json")
+    json_path = swap_ext(vtt_path, ".json")
     data = (
         json.loads(json_path.read_text(encoding="utf-8")) if json_path.exists() else {}
     )
@@ -1067,7 +1067,7 @@ def translate(
             )
 
     rep.stage("write translated VTT")
-    out_path = _swap_ext(vtt_path, f".{to}.vtt")
+    out_path = swap_ext(vtt_path, f".{to}.vtt")
     out_path.write_text(
         translate_mod.render_translated_vtt(blocks, trans, to_iso=to_iso_or(to, None)),
         encoding="utf-8",
@@ -1121,9 +1121,9 @@ def correct(
         out_path = vtt_path
     else:
         rep.stage("write sidecar VTT + audit json")
-        out_path = _swap_ext(vtt_path, ".asrfix.vtt")
+        out_path = swap_ext(vtt_path, ".asrfix.vtt")
         out_path.write_text(rendered, encoding="utf-8")
-        audit_path = _swap_ext(vtt_path, ".asrfix.json")
+        audit_path = swap_ext(vtt_path, ".asrfix.json")
         audit_path.write_text(
             json.dumps(
                 {"applied": applied, "rejected": rejected},

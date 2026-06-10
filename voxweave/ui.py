@@ -154,10 +154,10 @@ def summary_panel(
     normalized: bool = False,
 ) -> None:
     """Print transcription success panel: paths, language, cue count, and flags."""
-    from voxweave.pipeline import _swap_ext
+    from voxweave.pipeline import swap_ext
 
     vtt = Path(vtt_path)
-    json_path = _swap_ext(vtt, ".json")  # sibling derivation: never Path.with_suffix
+    json_path = swap_ext(vtt, ".json")  # sibling derivation: never Path.with_suffix
     lines = [f"VTT  : {vtt}", f"JSON : {json_path}"]
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))

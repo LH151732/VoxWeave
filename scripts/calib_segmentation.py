@@ -597,7 +597,7 @@ _MEDIA_EXTS = {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".avi", ".ts"}
 
 def _sibling_json(media: Path) -> Path:
     """Sibling .json path, replacing only the trailing extension (never
-    Path.with_suffix on interior-dot names — same contract as pipeline._swap_ext)."""
+    Path.with_suffix on interior-dot names — same contract as pipeline.swap_ext)."""
     return media.with_name(media.name[: -len(media.suffix)] + ".json")
 
 

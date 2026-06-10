@@ -1,6 +1,6 @@
 from voxweave.core.smart_split import (
-    _strip_punct_for_subtitles,
-    _wrap_cue_text,
+    strip_punct_for_subtitles,
+    wrap_cue_text,
     smart_split_segments,
 )
 
@@ -52,12 +52,12 @@ def test_smart_split_cjk_uses_no_space_join():
 
 def test_strip_punct_preserves_digit_internal_separators():
     # Digit-internal "." and "," must survive (3.75, 10,000); see CLAUDE.md invariant.
-    assert _strip_punct_for_subtitles("3.75 and 10,000") == "3.75 and 10,000"
+    assert strip_punct_for_subtitles("3.75 and 10,000") == "3.75 and 10,000"
 
 
 def test_strip_punct_replaces_visible_punctuation_with_space():
-    assert _strip_punct_for_subtitles("Hello, world!") == "Hello world"
-    assert _strip_punct_for_subtitles("价格是3.75元。") == "价格是3.75元"
+    assert strip_punct_for_subtitles("Hello, world!") == "Hello world"
+    assert strip_punct_for_subtitles("价格是3.75元。") == "价格是3.75元"
 
 
 # --------------------------------------------------------------------------- #
@@ -65,8 +65,8 @@ def test_strip_punct_replaces_visible_punctuation_with_space():
 # --------------------------------------------------------------------------- #
 def test_wrap_short_cue_unchanged():
     # short enough -> single line, no \n inserted
-    assert "\n" not in _wrap_cue_text("Hello world", "en", 2)
-    assert "\n" not in _wrap_cue_text("你好世界", "zh", 2)
+    assert "\n" not in wrap_cue_text("Hello world", "en", 2)
+    assert "\n" not in wrap_cue_text("你好世界", "zh", 2)
 
 
 def test_wrap_long_english_two_lines():
@@ -74,7 +74,7 @@ def test_wrap_long_english_two_lines():
         "It is the mark when educated mind to be able to "
         "entertain a thought without accepting it"
     )
-    out = _wrap_cue_text(text, "en", 2)
+    out = wrap_cue_text(text, "en", 2)
     lines = out.split("\n")
     assert len(lines) == 2
     # content preserved (only one space replaced by a newline, no words broken)
@@ -88,7 +88,7 @@ def test_wrap_embedded_english_in_cjk_uses_latin_budget():
         "It is the mark when educated mind to be able to "
         "entertain a thought without accepting it"
     )
-    out = _wrap_cue_text(text, "zh", 2)
+    out = wrap_cue_text(text, "zh", 2)
     assert out.count("\n") == 1
     assert out.replace("\n", " ") == text
 
@@ -111,7 +111,7 @@ def test_wrap_slides_sticky_token_down():
     # balance point lands right after "to the" -> both closed-class tokens slide
     # to line 2 (a line must not end on the/to); content preserved.
     text = "Tomorrow we are heading to the famous mountain village together"
-    out = _wrap_cue_text(text, "en", 2)
+    out = wrap_cue_text(text, "en", 2)
     lines = out.split("\n")
     assert len(lines) == 2
     assert lines[0].split()[-1].lower() not in {"the", "to", "of", "and"}
@@ -123,7 +123,7 @@ def test_wrap_slide_keeps_hard_budget():
     # rather than overflowing line 2.
     long_tail = "extraordinarily complicated multidimensional considerations"
     text = f"He finally pointed to the {long_tail}"
-    out = _wrap_cue_text(text, "en", 2)
+    out = wrap_cue_text(text, "en", 2)
     for line in out.split("\n"):
         assert sum(1 for _ in line) <= 60  # sanity: nothing absurd
     assert out.replace("\n", " ") == text
@@ -131,12 +131,12 @@ def test_wrap_slide_keeps_hard_budget():
 
 def test_wrap_preserves_cjk_comma_space():
     # the space produced by a stripped comma in CJK (好 我们) must not be swallowed by the wrap logic
-    assert _wrap_cue_text("好 我们一起走吧好吗", "zh", 2) == "好 我们一起走吧好吗"
+    assert wrap_cue_text("好 我们一起走吧好吗", "zh", 2) == "好 我们一起走吧好吗"
 
 
 def test_wrap_never_breaks_mid_word():
     text = "supercalifragilisticexpialidocious antidisestablishmentarianism today"
-    out = _wrap_cue_text(text, "en", 2)
+    out = wrap_cue_text(text, "en", 2)
     for line in out.split("\n"):
         # every line is composed of whole words; no long word is split mid-character
         assert all(w in text.split() for w in line.split())

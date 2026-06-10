@@ -18,15 +18,15 @@ DOTTED = (
 
 def test_swap_ext_preserves_mid_name_dots():
     m = Path(f"{DOTTED}.webm")
-    assert pipeline._swap_ext(m, ".vtt").name == f"{DOTTED}.vtt"
-    assert pipeline._swap_ext(m, ".json").name == f"{DOTTED}.json"
+    assert pipeline.swap_ext(m, ".vtt").name == f"{DOTTED}.vtt"
+    assert pipeline.swap_ext(m, ".json").name == f"{DOTTED}.json"
     # chained (translate output): .vtt -> .zh.vtt also must not truncate
-    v = pipeline._swap_ext(m, ".vtt")
-    assert pipeline._swap_ext(v, ".zh.vtt").name == f"{DOTTED}.zh.vtt"
+    v = pipeline.swap_ext(m, ".vtt")
+    assert pipeline.swap_ext(v, ".zh.vtt").name == f"{DOTTED}.zh.vtt"
 
 
 def test_swap_ext_no_suffix_appends():
-    assert pipeline._swap_ext(Path("README"), ".vtt").name == "README.vtt"
+    assert pipeline.swap_ext(Path("README"), ".vtt").name == "README.vtt"
 
 
 def test_process_dotted_filename_writes_full_siblings(tmp_path):

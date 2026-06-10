@@ -1291,12 +1291,12 @@ def smart_split_segments(
                 max_cue_s=th.max_cue_s,
             )
     for cue in cues:
-        cue["text"] = _strip_punct_for_subtitles(cue["text"])
+        cue["text"] = strip_punct_for_subtitles(cue["text"])
         if th is not None:  # stutter merging opt-in alongside gap-aware mode
             cue["text"] = _merge_stutters(cue["text"])
         # Display soft-wrap: fold over-budget cues into <=max_lines lines without
         # changing cue boundaries. Long Latin phrases inside CJK also collapse here.
-        cue["text"] = _wrap_cue_text(cue["text"], lang, max_lines)
+        cue["text"] = wrap_cue_text(cue["text"], lang, max_lines)
     return cues
 
 
@@ -1328,7 +1328,7 @@ _PUNCT_TO_SPACE_RE = re.compile(
 _WS_RE = re.compile(r"\s+")
 
 
-def _strip_punct_for_subtitles(text: str) -> str:
+def strip_punct_for_subtitles(text: str) -> str:
     """Replace punctuation with spaces (digit-internal . and , kept), then
     collapse whitespace runs and trim."""
     cleaned = _PUNCT_TO_SPACE_RE.sub(" ", text)
@@ -1417,7 +1417,7 @@ def _slide_sticky_line_ends(groups: List[List[Tuple[str, str]]], lang: str) -> N
             bot.insert(0, top.pop())
 
 
-def _wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
+def wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
     """Soft-wrap a cue into ``<=max_lines`` display lines (``\\n``-joined).
 
     Only changes rendered layout — cue boundaries and content are untouched.

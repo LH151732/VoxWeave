@@ -37,9 +37,9 @@ def strip_punct_for_subtitles(text: str) -> str:
 
     Decimal/thousands separators (digit.digit, digit,digit) and name joiners · ・ are preserved.
     """
-    from voxweave.core.smart_split import _strip_punct_for_subtitles
+    from voxweave.core.smart_split import strip_punct_for_subtitles
 
-    return _strip_punct_for_subtitles(_EXTRA_PUNCT_TO_SPACE_RE.sub(" ", text))
+    return strip_punct_for_subtitles(_EXTRA_PUNCT_TO_SPACE_RE.sub(" ", text))
 
 
 def build_payload(blocks: list[dict]) -> list[dict]:
@@ -97,13 +97,13 @@ def _layout_translated(text: str, to_iso: str | None) -> str:
     layout valve for translations that outgrow the line budget (an en cue packed
     to 2x42 chars can translate into 30+ zh chars). <=2 lines for every target:
     short text stays on one line (the wrap only triggers past the visual budget),
-    CJK gets kinsoku inside _wrap_cue_text.
+    CJK gets kinsoku inside wrap_cue_text.
     """
     if not to_iso:
         return text
-    from voxweave.core.smart_split import _wrap_cue_text
+    from voxweave.core.smart_split import wrap_cue_text
 
-    return _wrap_cue_text(text, to_iso, 2)
+    return wrap_cue_text(text, to_iso, 2)
 
 
 def render_translated_vtt(
