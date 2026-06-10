@@ -511,6 +511,45 @@ def _spans_in(raw: Any) -> list[tuple[float, float]] | None:
     return [(float(s), float(e)) for s, e in raw] if raw else None
 
 
+def _maybe_adaptive_thresholds(th: dict, units: list[dict]) -> dict:
+    """Scale clause/offline gap thresholds to this file's gap distribution.
+
+    EXPERIMENTAL, default off: opt in via VOXWEAVE_GAP_ADAPTIVE=1. Replaces the
+    static clause_ms (and offline_ms at the same clause:offline ratio) with a
+    per-file estimate from the inter-unit gap distribution; vad_skip_ms is
+    untouched. Validate against scripts/calib_segmentation.py before trusting.
+    """
+    if os.environ.get("VOXWEAVE_GAP_ADAPTIVE", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return th
+    from voxweave.core.gap_split import adaptive_clause_ms
+
+    gaps_ms: list[float] = []
+    for prev, nxt in zip(units, units[1:]):
+        pe, ns = prev.get("end"), nxt.get("start")
+        if pe is not None and ns is not None:
+            gaps_ms.append((float(ns) - float(pe)) * 1000.0)
+    clause = adaptive_clause_ms(gaps_ms)
+    if clause is None:
+        return th
+    ratio = th["offline_ms"] / th["clause_ms"] if th.get("clause_ms") else 1.75
+    out = dict(th)
+    out["clause_ms"] = clause
+    out["offline_ms"] = round(clause * ratio)
+    log.info(
+        "adaptive gap thresholds: clause %dms offline %dms (static %s/%s)",
+        out["clause_ms"],
+        out["offline_ms"],
+        th.get("clause_ms"),
+        th.get("offline_ms"),
+    )
+    return out
+
+
 def _dump_sibling_json(
     json_path: Path,
     *,
@@ -648,7 +687,7 @@ def process(
         [seg],
         lang=iso,
         speech_spans=vad_speech,
-        thresholds=gap_thresholds(iso),
+        thresholds=_maybe_adaptive_thresholds(gap_thresholds(iso), units),
         shot_changes=shot_changes,
     )
 
@@ -691,7 +730,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
         [seg],
         lang=iso,
         speech_spans=speech_spans,
-        thresholds=gap_thresholds(iso),
+        thresholds=_maybe_adaptive_thresholds(gap_thresholds(iso), units),
         shot_changes=shot_changes,
         **smart_split_kwargs,
     )

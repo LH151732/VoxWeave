@@ -26,6 +26,38 @@ def _overlaps_speech(
     return False
 
 
+def adaptive_clause_ms(
+    gaps_ms: list[float],
+    *,
+    lo: int = 300,
+    hi: int = 800,
+    min_samples: int = 50,
+    percentile: float = 90.0,
+    margin: float = 1.15,
+) -> int | None:
+    """Per-file clause threshold from the sub-2s inter-unit gap distribution.
+
+    clause_ms separates intra-clause articulation gaps from real pauses; the
+    static default (400ms, ja x1.4) is a corpus-level compromise — a fast
+    talker's p90 articulation gap sits far below a slow narrator's. p90 of
+    sub-2s positive gaps, a safety margin, and a [lo, hi] clamp adapt it per
+    file. EXPERIMENTAL: opt in via VOXWEAVE_GAP_ADAPTIVE=1 and validate with
+    scripts/calib_segmentation.py before trusting a new corpus. Returns None
+    when the file has too few gap samples to estimate a distribution.
+    """
+    sub = sorted(g for g in gaps_ms if 0 < g < 2000)
+    if len(sub) < min_samples:
+        return None
+    idx = (len(sub) - 1) * percentile / 100.0
+    base = int(idx)
+    frac = idx - base
+    if base + 1 < len(sub):
+        p = sub[base] * (1 - frac) + sub[base + 1] * frac
+    else:
+        p = sub[-1]
+    return max(lo, min(hi, round(p * margin)))
+
+
 def gap_qualifies(
     prev_end: float | None,
     next_start: float | None,
