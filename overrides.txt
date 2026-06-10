@@ -1,0 +1,13 @@
+# uv resolver overrides, passed by the Makefile to `uv tool install --overrides`.
+#
+# `uv tool install` does NOT read [tool.uv] override-dependencies from the installed
+# project's pyproject.toml (that section only applies to the project/workspace workflow,
+# e.g. `make dev` / `uv sync`), so the same rule must be supplied here for the tool
+# install path. Keep in sync with [tool.uv] override-dependencies in pyproject.toml.
+#
+# ctc-forced-aligner (and faster-whisper on CUDA) hard-depend on the CPU `onnxruntime`
+# package, which shares the `onnxruntime` import directory with `onnxruntime-gpu`:
+# whichever wheel unpacks last wins the shared files (non-deterministic), and the CPU
+# build silently drops CUDAExecutionProvider (MMS alignment falls back to CPU).
+# Restrict CPU onnxruntime to macOS, where it is the intended backend.
+onnxruntime; sys_platform == 'darwin'

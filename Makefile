@@ -18,8 +18,12 @@ else
   TORCH_BACKEND ?= cu128
 endif
 
+# --overrides is required: `uv tool install` ignores [tool.uv] override-dependencies in
+# pyproject.toml, so without it the CPU `onnxruntime` (pulled by ctc-forced-aligner /
+# faster-whisper) races onnxruntime-gpu for the shared import directory and can silently
+# drop CUDAExecutionProvider. See overrides.txt.
 install:
-	uv tool install --force --torch-backend=$(TORCH_BACKEND) ".[$(VARIANT)]"
+	uv tool install --force --torch-backend=$(TORCH_BACKEND) --overrides overrides.txt ".[$(VARIANT)]"
 	@voxweave --version
 	@git diff --quiet 2>/dev/null && echo "installed (git $$(git rev-parse --short HEAD))" || echo "installed (git $$(git rev-parse --short HEAD), uncommitted changes present)"
 
@@ -32,7 +36,7 @@ mps:
 
 # Force reinstall after pulling new code.
 reinstall:
-	uv tool install --force --reinstall --torch-backend=$(TORCH_BACKEND) ".[$(VARIANT)]"
+	uv tool install --force --reinstall --torch-backend=$(TORCH_BACKEND) --overrides overrides.txt ".[$(VARIANT)]"
 	@voxweave --version
 	@git diff --quiet 2>/dev/null && echo "reinstalled (git $$(git rev-parse --short HEAD))" || echo "reinstalled (git $$(git rev-parse --short HEAD), uncommitted changes present)"
 

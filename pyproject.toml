@@ -100,6 +100,8 @@ dev = ["pytest>=8"]
 # unusably slow on a 24-minute episode). We restrict CPU onnxruntime to Darwin: on macOS it is the
 # correct (and only) build, while on Linux the marker is false so it is dropped and the [cuda]
 # extra's onnxruntime-gpu satisfies `import onnxruntime` with the CUDA provider intact.
+# NOTE: this section only applies to the project workflow (`make dev` / uv sync). `uv tool install`
+# ignores it, so the Makefile passes the same rule via `--overrides overrides.txt` — keep both in sync.
 override-dependencies = ["onnxruntime; sys_platform == 'darwin'"]
 # [cuda] (qwen-asr -> transformers==4.57.6) and [mps] (mlx-audio -> transformers>=5.5) are mutually
 # exclusive: declaring them conflicting lets uv resolve each in its own fork instead of trying to
