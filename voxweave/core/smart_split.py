@@ -487,6 +487,60 @@ def split_at_sentence_end(
     return cues
 
 
+@dataclass(frozen=True)
+class SplitThresholds:
+    """Gap-aware segmentation knobs — one typed source for field names + defaults.
+
+    Built from ``config.gap_thresholds()``'s mapping at the ``smart_split_segments`` boundary via
+    :meth:`from_mapping`. Passing ``thresholds=None`` to ``smart_split_segments`` selects the
+    legacy length-break-only path (gap/duration breaks and the cleanup pass are skipped), so these
+    values are only read in gap-aware mode.
+    """
+
+    clause_ms: int = 400
+    vad_skip_ms: int = 1000
+    offline_ms: int = 700
+    min_cue_s: float = 0.5
+    max_cue_s: float = 7.0
+    glue_gap_s: float = GLUE_MAX_GAP_S
+    # Reading-speed linger (0 = off): a cue shorter than reading_chars/cps extends
+    # into the following gap, capped at LINGER_CAP_S past speech end. lag_out_s is
+    # a flat tail pad applied to every cue end (0 = off). config.gap_thresholds
+    # supplies per-language values; the dataclass defaults keep both off so direct
+    # constructions (tests/legacy) preserve exact timing.
+    cps: float = 0.0
+    lag_out_s: float = 0.0
+    # Shot-change snap window (0 = off): a cue boundary within this of a detected
+    # cut moves onto it (see _snap_to_shots). Only consulted when the caller
+    # passes shot_changes.
+    shot_snap_s: float = 0.24
+
+    @classmethod
+    def from_mapping(cls, d: dict) -> SplitThresholds:
+        """Build from a (possibly partial) mapping, ignoring unknown keys and filling defaults."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+@dataclass(frozen=True)
+class SplitContext:
+    """Per-call segmentation context: language, line budget, thresholds, VAD.
+
+    Bundles the invariants of one ``split_long_cues_with_word_timings`` call so
+    they travel into the packing loop (``_pack_atoms_into_chunks`` /
+    ``_classify_atom_break``) as one value instead of five parallel parameters.
+    ``do_new=False`` is the legacy length-break-only path: gap/duration breaks
+    are disabled and ``th`` is a never-read placeholder.
+    """
+
+    lang: str
+    max_line_length: int
+    max_lines: int
+    th: SplitThresholds
+    do_new: bool
+    speech_spans: list[tuple[float, float]] | None = None
+
+
 def _gap_ms(prev_end: float | None, next_start: float | None) -> float | None:
     """Inter-atom gap in ms (None when either bound is missing/non-positive)."""
     if prev_end is None or next_start is None:
@@ -569,16 +623,11 @@ def _classify_atom_break(
     atom: dict,
     *,
     at_boundary: bool,
-    do_new: bool,
-    th: SplitThresholds,
-    speech_spans: list[tuple[float, float]] | None,
-    max_line_length: int,
-    max_lines: int,
-    lang: str,
+    ctx: SplitContext,
 ) -> tuple[bool, bool, bool]:
     """Decide ``(gap_break, dur_break, len_break)`` for appending ``atom`` after ``cur``.
 
-    Pure: reads ``cur``/``atom``/thresholds, mutates nothing. All-False when ``cur`` is empty
+    Pure: reads ``cur``/``atom``/``ctx``, mutates nothing. All-False when ``cur`` is empty
     (the first atom of a chunk never breaks).
     - gap_break: a qualifying inter-atom pause, but only at a phrase boundary, and suppressed in
       the clause_ms..vad_skip_ms zone when it would strand a sticky token at line end.
@@ -588,18 +637,19 @@ def _classify_atom_break(
     """
     if not cur:
         return False, False, False
+    th = ctx.th
     prev = cur[-1]
     # Gap/len breaks require a word boundary (no-space langs): atom must be a BudouX(ja)/jieba(zh)
     # phrase start. Guards against CTC timing errors on OOV chars creating spurious intra-word gaps
     # (e.g. 酒造り: 番酒造 OOV drift makes a 2.1s gap between 造 and り, but BudouX keeps 番酒造りが
     # as one phrase, suppressing the spurious split). The dur_break cap is exempt and always cuts.
     gap_break = (
-        do_new
+        ctx.do_new
         and at_boundary
         and gap_qualifies(
             prev.get("end"),
             atom.get("start"),
-            speech_spans,
+            ctx.speech_spans,
             clause_ms=th.clause_ms,
             vad_skip_ms=th.vad_skip_ms,
             offline_ms=th.offline_ms,
@@ -612,9 +662,10 @@ def _classify_atom_break(
         gms = _gap_ms(prev.get("end"), atom.get("start"))
         if gms is not None and th.clause_ms <= gms < th.vad_skip_ms:
             gap_break = False
-    tentative = _join([a["text"] for a in cur + [atom]], lang)
+    tentative = _join([a["text"] for a in cur + [atom]], ctx.lang)
     len_overflow = (
-        split_subtitle(tentative, max_line_length, lang).count("\n") + 1 > max_lines
+        split_subtitle(tentative, ctx.max_line_length, ctx.lang).count("\n") + 1
+        > ctx.max_lines
     )
     len_break = len_overflow and at_boundary
     # Boundary-less overlong run (a single phrase atom exceeding the budget by
@@ -625,12 +676,12 @@ def _classify_atom_break(
         len_overflow
         and not len_break
         and _token_char_count(tentative)
-        > round(FORCE_BREAK_FACTOR * max_line_length * max_lines)
+        > round(FORCE_BREAK_FACTOR * ctx.max_line_length * ctx.max_lines)
     ):
         len_break = True
     start0 = _span_start(cur)
     dur_break = (
-        do_new
+        ctx.do_new
         and start0 is not None
         and atom.get("end") is not None
         and (atom["end"] - start0) > th.max_cue_s
@@ -642,12 +693,7 @@ def _pack_atoms_into_chunks(
     atoms: List[dict],
     *,
     boundary: set[int] | None,
-    do_new: bool,
-    th: SplitThresholds,
-    speech_spans: list[tuple[float, float]] | None,
-    max_line_length: int,
-    max_lines: int,
-    lang: str,
+    ctx: SplitContext,
 ) -> List[List[dict]]:
     """Greedily pack atoms into chunks, cutting on the first qualifying gap/dur/len break.
 
@@ -662,15 +708,7 @@ def _pack_atoms_into_chunks(
     for i, atom in enumerate(atoms):
         at_boundary = boundary is None or i in boundary
         gap_break, dur_break, len_break = _classify_atom_break(
-            cur,
-            atom,
-            at_boundary=at_boundary,
-            do_new=do_new,
-            th=th,
-            speech_spans=speech_spans,
-            max_line_length=max_line_length,
-            max_lines=max_lines,
-            lang=lang,
+            cur, atom, at_boundary=at_boundary, ctx=ctx
         )
         if cur and (gap_break or dur_break):
             chunks.append(cur)
@@ -716,7 +754,14 @@ def split_long_cues_with_word_timings(
     never-read placeholder there).
     """
     do_new = thresholds is not None
-    th = thresholds if thresholds is not None else SplitThresholds()
+    ctx = SplitContext(
+        lang=lang,
+        max_line_length=max_line_length,
+        max_lines=max_lines,
+        th=thresholds if thresholds is not None else SplitThresholds(),
+        do_new=do_new,
+        speech_spans=speech_spans,
+    )
     new_cues: List[Dict[str, Any]] = []
     for cue in cues:
         word_data = list(cue.get("word_data") or [])
@@ -732,16 +777,7 @@ def split_long_cues_with_word_timings(
             else None
         )
         _attach_end_penalties(atoms, boundary, lang)
-        chunks = _pack_atoms_into_chunks(
-            atoms,
-            boundary=boundary,
-            do_new=do_new,
-            th=th,
-            speech_spans=speech_spans,
-            max_line_length=max_line_length,
-            max_lines=max_lines,
-            lang=lang,
-        )
+        chunks = _pack_atoms_into_chunks(atoms, boundary=boundary, ctx=ctx)
         new_cues.extend(_chunk_to_cue(chunk, cue, lang) for chunk in chunks)
     return new_cues
 
@@ -779,41 +815,6 @@ def _split_without_timings(
         out.append({"text": text, "start": start, "end": end, "word_data": []})
         start = end
     return out
-
-
-@dataclass(frozen=True)
-class SplitThresholds:
-    """Gap-aware segmentation knobs — one typed source for field names + defaults.
-
-    Built from ``config.gap_thresholds()``'s mapping at the ``smart_split_segments`` boundary via
-    :meth:`from_mapping`. Passing ``thresholds=None`` to ``smart_split_segments`` selects the
-    legacy length-break-only path (gap/duration breaks and the cleanup pass are skipped), so these
-    values are only read in gap-aware mode.
-    """
-
-    clause_ms: int = 400
-    vad_skip_ms: int = 1000
-    offline_ms: int = 700
-    min_cue_s: float = 0.5
-    max_cue_s: float = 7.0
-    glue_gap_s: float = GLUE_MAX_GAP_S
-    # Reading-speed linger (0 = off): a cue shorter than reading_chars/cps extends
-    # into the following gap, capped at LINGER_CAP_S past speech end. lag_out_s is
-    # a flat tail pad applied to every cue end (0 = off). config.gap_thresholds
-    # supplies per-language values; the dataclass defaults keep both off so direct
-    # constructions (tests/legacy) preserve exact timing.
-    cps: float = 0.0
-    lag_out_s: float = 0.0
-    # Shot-change snap window (0 = off): a cue boundary within this of a detected
-    # cut moves onto it (see _snap_to_shots). Only consulted when the caller
-    # passes shot_changes.
-    shot_snap_s: float = 0.24
-
-    @classmethod
-    def from_mapping(cls, d: dict) -> SplitThresholds:
-        """Build from a (possibly partial) mapping, ignoring unknown keys and filling defaults."""
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 def smart_split_segments(

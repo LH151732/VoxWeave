@@ -10,9 +10,10 @@ come from ``layout``.
 from __future__ import annotations
 
 import bisect
-from typing import Any, Dict, List
+from typing import List, cast
 
 from .layout import _fits_budget, _no_spaces, _reading_chars, _visual_len
+from .schema import Cue
 
 TWO_FRAME_S = 2.0 / 24.0  # ~0.083s Netflix min inter-cue gap
 CHAIN_MAX_GAP_S = 0.5  # gaps below this are "dead zone" -> chain to 2 frames
@@ -34,20 +35,20 @@ def _is_short_fragment(text: str, lang: str) -> bool:
     return len(t.split()) == 1
 
 
-def _gap_between(a: Dict[str, Any], b: Dict[str, Any]) -> float | None:
+def _gap_between(a: Cue, b: Cue) -> float | None:
     """Inter-cue gap a->b (b.start - a.end), or None if either bound is missing."""
     ae, bs = a.get("end"), b.get("start")
     return (bs - ae) if ae is not None and bs is not None else None
 
 
 def _merge_micro_cues(
-    cues: List[Dict[str, Any]],
+    cues: List[Cue],
     lang: str,
     *,
     max_gap_s: float,
     max_line_length: int,
     max_cue_s: float,
-) -> List[Dict[str, Any]]:
+) -> List[Cue]:
     """Merge adjacent cues separated by sub-glue gaps when the merge fits one line.
 
     Folds rapid micro-sentence chains (そう。だね。 / "Yeah." "Right.") into one
@@ -60,7 +61,7 @@ def _merge_micro_cues(
     if max_gap_s <= 0 or len(cues) < 2:
         return cues
     sep = "" if _no_spaces(lang) else " "
-    out = [dict(cues[0])]
+    out = [cast(Cue, dict(cues[0]))]
     for nxt in cues[1:]:
         cur = out[-1]
         gap = _gap_between(cur, nxt)
@@ -81,13 +82,11 @@ def _merge_micro_cues(
                 nxt.get("word_data") or []
             )
             continue
-        out.append(dict(nxt))
+        out.append(cast(Cue, dict(nxt)))
     return out
 
 
-def _glue_short_cues(
-    cues: List[Dict[str, Any]], lang: str, *, max_gap_s: float
-) -> List[Dict[str, Any]]:
+def _glue_short_cues(cues: List[Cue], lang: str, *, max_gap_s: float) -> List[Cue]:
     """Glue a super-short single-word flicker cue onto whichever neighbor abuts it
     closest, when that gap is below ``max_gap_s`` — contiguous speech means a
     spurious split, not a real pause.
@@ -102,8 +101,8 @@ def _glue_short_cues(
     if max_gap_s <= 0 or len(cues) < 2:
         return cues
     sep = "" if _no_spaces(lang) else " "
-    work = [dict(c) for c in cues]
-    out: List[Dict[str, Any]] = []
+    work = [cast(Cue, dict(c)) for c in cues]
+    out: List[Cue] = []
     i, n = 0, len(work)
     while i < n:
         c = work[i]
@@ -152,13 +151,13 @@ def _glue_short_cues(
 
 
 def _cleanup_cues(
-    cues: List[Dict[str, Any]],
+    cues: List[Cue],
     *,
     min_cue_s: float,
     max_cue_s: float,
     cps: float = 0.0,
     lag_out_s: float = 0.0,
-) -> List[Dict[str, Any]]:
+) -> List[Cue]:
     """Timing-only pass — never merges content across a real pause.
 
     - Extends short cues into the following gap (no overlap) up to min_cue_s.
@@ -170,7 +169,7 @@ def _cleanup_cues(
     - Visible gaps (>=1s) are left untouched.
     - max_cue_s prevents any extension from re-inflating past the segmentation cap.
     """
-    out = [dict(c) for c in cues]
+    out = [cast(Cue, dict(c)) for c in cues]
     for i, c in enumerate(out):
         nxt_start = out[i + 1]["start"] if i + 1 < len(out) else None
         # desired duration: min-dur floor, CPS reading time (capped linger), tail pad
@@ -199,12 +198,12 @@ def _cleanup_cues(
 
 
 def _snap_to_shots(
-    cues: List[Dict[str, Any]],
+    cues: List[Cue],
     shots: List[float],
     *,
     snap_s: float,
     max_cue_s: float,
-) -> List[Dict[str, Any]]:
+) -> List[Cue]:
     """Snap cue boundaries onto nearby shot changes (runs after _cleanup_cues).
 
     A boundary within ``snap_s`` of a cut moves onto it, but never at speech's
@@ -221,7 +220,7 @@ def _snap_to_shots(
     """
     if snap_s <= 0 or not shots:
         return cues
-    out = [dict(c) for c in cues]
+    out = [cast(Cue, dict(c)) for c in cues]
 
     def nearest(t: float) -> float | None:
         i = bisect.bisect_left(shots, t)
