@@ -9,6 +9,8 @@
 Vocal separation and song-skip so ASR never hallucinates on background music, OP/ED, or
 insert songs. Local-first Qwen3 ASR, forced alignment, and edit-and-resync — CJK-aware.
 
+[![CI](https://github.com/hali0515/VoxWeave/actions/workflows/ci.yml/badge.svg)](https://github.com/hali0515/VoxWeave/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/voxweave)](https://pypi.org/project/voxweave/)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)
 ![CUDA cu128](https://img.shields.io/badge/CUDA-cu128-76B900?logo=nvidia&logoColor=white)
