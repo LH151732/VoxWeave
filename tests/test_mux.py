@@ -151,16 +151,31 @@ def test_pack_rejects_plain_text_draft(tmp_path):
 # --- burn building blocks ----------------------------------------------------
 
 
-def test_burn_pix_fmt_policy():
-    # hevc/av1 preserve 10-bit; h264 is always 8-bit (nvenc h264 cannot do 10)
-    assert mux._burn_pix_fmt("hevc_nvenc", True) == "p010le"
-    assert mux._burn_pix_fmt("hevc_nvenc", False) == "nv12"
-    assert mux._burn_pix_fmt("av1_nvenc", True) == "p010le"
-    assert mux._burn_pix_fmt("h264_nvenc", True) == "nv12"
-    assert mux._burn_pix_fmt("hevc_videotoolbox", True) == "p010le"
-    assert mux._burn_pix_fmt("libx265", True) == "yuv420p10le"
-    assert mux._burn_pix_fmt("libx265", False) == "yuv420p"
-    assert mux._burn_pix_fmt("libx264", True) == "yuv420p"
+def test_src_bit_depth_parsing():
+    # bits_per_raw_sample is authoritative when present
+    assert mux.src_bit_depth({"pix_fmt": "yuv420p", "bits_per_raw_sample": "10"}) == 10
+    # otherwise the trailing endianness-suffixed digits of pix_fmt
+    assert mux.src_bit_depth({"pix_fmt": "yuv420p10le"}) == 10
+    assert mux.src_bit_depth({"pix_fmt": "yuv420p12le"}) == 12
+    assert mux.src_bit_depth({"pix_fmt": "p010le"}) == 10
+    assert mux.src_bit_depth({"pix_fmt": "yuv420p"}) == 8
+    assert mux.src_bit_depth({"pix_fmt": "nv12"}) == 8  # 12 is layout, not depth
+    assert mux.src_bit_depth({}) == 8
+
+
+def test_burn_pix_fmt_matches_source_depth():
+    # depth follows the source, clamped to encoder capability
+    assert mux._burn_pix_fmt("hevc_nvenc", 10) == "p010le"
+    assert mux._burn_pix_fmt("hevc_nvenc", 8) == "nv12"
+    assert mux._burn_pix_fmt("hevc_nvenc", 12) == "p010le"  # NVENC tops out at 10
+    assert mux._burn_pix_fmt("av1_nvenc", 10) == "p010le"
+    assert mux._burn_pix_fmt("h264_nvenc", 10) == "nv12"  # h264 is always 8-bit
+    assert mux._burn_pix_fmt("hevc_videotoolbox", 10) == "p010le"
+    assert mux._burn_pix_fmt("libx265", 10) == "yuv420p10le"
+    assert mux._burn_pix_fmt("libx265", 12) == "yuv420p12le"  # x265 keeps 12-bit
+    assert mux._burn_pix_fmt("libx265", 8) == "yuv420p"
+    assert mux._burn_pix_fmt("libsvtav1", 12) == "yuv420p10le"  # svt clamps to 10
+    assert mux._burn_pix_fmt("libx264", 10) == "yuv420p"
 
 
 def test_encoder_args_constant_quality_only():
@@ -187,7 +202,7 @@ def test_build_burn_cmd_hevc_mp4():
         encoder="hevc_nvenc",
         quality=23,
         container="mp4",
-        src_10bit=True,
+        src_depth=10,
         audio_codecs=["flac"],
     )
     assert cmd[:2] == ["ffmpeg", "-nostdin"]
@@ -209,7 +224,7 @@ def test_build_burn_cmd_mkv_copies_audio_no_tag():
         encoder="libx264",
         quality=19,
         container="mkv",
-        src_10bit=False,
+        src_depth=8,
         audio_codecs=["flac"],
     )
     assert "-hwaccel" not in cmd  # software path

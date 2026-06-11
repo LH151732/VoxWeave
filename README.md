@@ -355,9 +355,11 @@ voxweave burn episode.zh.vtt --quality 20 --font "Noto Sans CJK SC"
 | `--font-size`  | Override the default 72-at-1080p scaled size.                                                              |
 
 Bitrate is never targeted: pure constant-quality (`-b:v 0` on NVENC) lets the encoder spend
-bits where the content needs them, with no overshoot against the source rate. Source bit
-depth is preserved (10-bit stays 10-bit via `p010le`/`yuv420p10le`) except on h264 paths,
-which are kept 8-bit for player compatibility (NVENC h264 cannot encode 10-bit at all).
+bits where the content needs them, with no overshoot against the source rate. Output bit
+depth follows the source dynamically (8-bit stays 8-bit, 10-bit stays 10-bit; 12-bit is kept
+on libx265 and clamped to 10 on NVENC/VideoToolbox/SVT-AV1, which top out there) — except on
+h264 paths, which are always 8-bit for player compatibility (NVENC h264 cannot encode 10-bit
+at all).
 
 </details>
 

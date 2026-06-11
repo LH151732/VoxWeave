@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -361,14 +362,45 @@ def _encoder_args(encoder: str, quality: int) -> list[str]:
     return ["-preset", "slow", "-crf", str(quality)]  # libx264 / libx265
 
 
-def _burn_pix_fmt(encoder: str, src_10bit: bool) -> str:
-    """Output pixel format: preserve 10-bit sources except on h264 paths
-    (h264_nvenc cannot encode 10-bit, and 10-bit AVC has poor player support)."""
+_BIT_DEPTH_RE = re.compile(r"(\d+)(?:le|be)$")
+
+
+def src_bit_depth(video_stream: dict) -> int:
+    """Per-component bit depth of the source video stream (8 when unknown).
+
+    ``bits_per_raw_sample`` is authoritative when ffprobe reports it; otherwise
+    the depth is parsed from the pix_fmt's trailing endianness-suffixed digits
+    ("yuv420p10le" -> 10). Plain 8-bit formats ("yuv420p", "nv12") carry no such
+    suffix and fall through to 8 -- the 12 in nv12 is layout, not depth.
+    """
+    raw = str(video_stream.get("bits_per_raw_sample") or "")
+    if raw.isdigit():
+        return int(raw)
+    m = _BIT_DEPTH_RE.search(str(video_stream.get("pix_fmt") or ""))
+    return int(m.group(1)) if m else 8
+
+
+def _burn_pix_fmt(encoder: str, src_depth: int) -> str:
+    """Output pixel format: match the source bit depth, clamped to what the
+    encoder can produce.
+
+    h264 paths are always 8-bit (h264_nvenc cannot encode 10-bit, and 10-bit
+    AVC has poor player support). NVENC/VideoToolbox/SVT-AV1 top out at 10-bit,
+    so 12-bit sources clamp to 10 there; libx265 keeps 12-bit. Chroma is always
+    4:2:0 for playback compatibility.
+    """
+    hw = encoder.endswith(("_nvenc", "_videotoolbox"))
     if "264" in encoder:  # h264_nvenc / h264_videotoolbox / libx264
-        return "nv12" if encoder.endswith(("_nvenc", "_videotoolbox")) else "yuv420p"
-    if encoder.endswith(("_nvenc", "_videotoolbox")):
-        return "p010le" if src_10bit else "nv12"
-    return "yuv420p10le" if src_10bit else "yuv420p"
+        depth = 8
+    elif encoder == "libx265":
+        depth = max(d for d in (8, 10, 12) if d <= max(src_depth, 8))
+    else:  # hevc/av1 nvenc, hevc_videotoolbox, libsvtav1
+        depth = max(d for d in (8, 10) if d <= max(src_depth, 8))
+    if depth == 8:
+        return "nv12" if hw else "yuv420p"
+    if hw:
+        return "p010le"  # the only >8-bit 4:2:0 format these encoders take
+    return f"yuv420p{depth}le"
 
 
 def _filter_escape(path: str) -> str:
@@ -387,7 +419,7 @@ def build_burn_cmd(
     encoder: str,
     quality: int,
     container: str,
-    src_10bit: bool,
+    src_depth: int,
     audio_codecs: list[str],
 ) -> list[str]:
     """Build the ffmpeg argv that burns the styled ASS into the video.
@@ -396,7 +428,7 @@ def build_burn_cmd(
     to AAC only when the target is mp4 and a source codec cannot live there);
     every source subtitle track is dropped (they are burnt in now).
     """
-    pix = _burn_pix_fmt(encoder, src_10bit)
+    pix = _burn_pix_fmt(encoder, src_depth)
     cmd: list[str] = [
         "ffmpeg",
         "-nostdin",
@@ -454,7 +486,7 @@ def burn(
         raise RuntimeError(f"{src.name} has no video stream to burn into")
     width = int(video.get("width") or 1920)
     height = int(video.get("height") or 1080)
-    src_10bit = "10" in str(video.get("pix_fmt") or "")
+    depth = src_bit_depth(video)
     audio_codecs = [
         str(s.get("codec_name") or "")
         for s in streams
@@ -478,7 +510,7 @@ def burn(
             encoder=enc,
             quality=q,
             container=container,
-            src_10bit=src_10bit,
+            src_depth=depth,
             audio_codecs=audio_codecs,
         )
         logger.info("burning with %s (quality %s, %s)", enc, q, container)
