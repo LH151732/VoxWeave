@@ -164,6 +164,14 @@ def build_messages(
         "Preserve the cue count: never merge, split, add, or drop cues -- each source cue maps to "
         "exactly one translated cue.",
         "Keep it colloquial and concise, fit for on-screen subtitles.",
+        "When a literal translation would be too long to read comfortably as a subtitle, condense "
+        "rather than truncate: drop redundancies, false starts, and hesitation fillers while keeping "
+        "the meaning and tone.",
+        "Numbers follow target-language subtitle convention: spell out small numbers (one through "
+        "ten) in dialogue; use digits for times, dates, scores, measurements, and longer numbers. "
+        "Do not convert units of measurement -- render the original units naturally.",
+        "Avoid abbreviations and acronyms unless they are the standard spoken form in the target "
+        "language.",
         "Do not output decorative punctuation such as quotation marks, brackets, ellipses, or dashes "
         "(subtitle style).",
         'Return JSON only, in the form: {"translations": [{"i": <source index>, "t": "<translation>"}, ...]}, '
