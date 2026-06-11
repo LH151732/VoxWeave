@@ -301,15 +301,55 @@ def _slide_sticky_line_ends(groups: List[List[Tuple[str, str]]], lang: str) -> N
             bot.insert(0, top.pop())
 
 
+# Two-line break scoring: a sticky line end (closed-class token) must outweigh
+# any balance gain; an orphan (lone short word on a line) outweighs moderate
+# imbalance but yields to sticky ends.
+_STICKY_END_WEIGHT = 100
+_ORPHAN_WEIGHT = 30
+_ORPHAN_MAX_VIS = 10
+
+
+def _two_line_break_index(units: List[Tuple[str, str]], lang: str) -> int | None:
+    """Best break index for a two-line wrap, or None when no two-line split fits.
+
+    Scores every break where both lines fit the hard visual budget:
+    line-length imbalance + sticky line-end penalty (the same line_end_penalty
+    signal the segmentation engine uses) + orphan penalty for a lone short
+    word stranded on either line. Ties prefer bottom-heavy (pyramid) shape.
+    """
+    n = len(units)
+    best_i: int | None = None
+    best_score: float | None = None
+    for i in range(1, n):
+        top_w = _vis_width(_join_line(units[:i]))
+        if top_w > DEFAULT_MAX_LINE_LENGTH:
+            break  # top line only grows from here
+        bot_w = _vis_width(_join_line(units[i:]))
+        if bot_w > DEFAULT_MAX_LINE_LENGTH:
+            continue
+        score: float = abs(top_w - bot_w)
+        score += _STICKY_END_WEIGHT * line_end_penalty(units[i - 1][0], lang)
+        if i == 1 and top_w <= _ORPHAN_MAX_VIS:
+            score += _ORPHAN_WEIGHT
+        if i == n - 1 and bot_w <= _ORPHAN_MAX_VIS:
+            score += _ORPHAN_WEIGHT
+        if top_w > bot_w:
+            score += 1  # tie-break: bottom-heavy reads better
+        if best_score is None or score < best_score:
+            best_i, best_score = i, score
+    return best_i
+
+
 def wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
     """Soft-wrap a cue into ``<=max_lines`` display lines (``\\n``-joined).
 
     Only changes rendered layout — cue boundaries and content are untouched.
     Wraps only when visual width exceeds ``DEFAULT_MAX_LINE_LENGTH``; short CJK
-    cues with brief Latin phrases stay on one line. Lines are balanced at
-    ``ceil(total/max_lines)`` to avoid stranding a fragment on the last line,
-    then line ends are cleaned: kinsoku char rules for ja/zh, sticky-token
-    slide for spaced languages.
+    cues with brief Latin phrases stay on one line. Two-line wraps pick the
+    break by exhaustive scoring (balance + sticky-end + orphan, see
+    ``_two_line_break_index``); deeper wraps balance greedily at
+    ``ceil(total/max_lines)``. Line ends are then cleaned: kinsoku char rules
+    for ja/zh, sticky-token slide for the greedy path.
     """
     units = _wrap_units(text, lang)
     if len(units) <= 1:
@@ -317,23 +357,29 @@ def wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
     total = _vis_width(_join_line(units))
     if total <= DEFAULT_MAX_LINE_LENGTH:  # fits on one line -> no wrap needed
         return _join_line(units)
-    target = -(-total // max_lines)  # ceil div: balance across max_lines lines
-    groups: List[List[Tuple[str, str]]] = []
-    cur: List[Tuple[str, str]] = []
-    for u in units:
-        if (
-            cur
-            and _vis_width(_join_line(cur + [u])) > target
-            and len(groups) < max_lines - 1
-        ):
+    groups: List[List[Tuple[str, str]]] | None = None
+    if max_lines == 2:
+        bi = _two_line_break_index(units, lang)
+        if bi is not None:
+            groups = [list(units[:bi]), list(units[bi:])]
+    if groups is None:  # 3+ lines, or no two-line split fits the hard budget
+        target = -(-total // max_lines)  # ceil div: balance across max_lines
+        groups = []
+        cur: List[Tuple[str, str]] = []
+        for u in units:
+            if (
+                cur
+                and _vis_width(_join_line(cur + [u])) > target
+                and len(groups) < max_lines - 1
+            ):
+                groups.append(cur)
+                cur = [u]
+            else:
+                cur.append(u)
+        if cur:
             groups.append(cur)
-            cur = [u]
-        else:
-            cur.append(u)
-    if cur:
-        groups.append(cur)
-    if not _no_spaces(lang) and len(groups) > 1:
-        _slide_sticky_line_ends(groups, lang)
+        if not _no_spaces(lang) and len(groups) > 1:
+            _slide_sticky_line_ends(groups, lang)
     lines = [_join_line(g) for g in groups]
     if lang in {"ja", "zh"} and len(lines) > 1:
         from .kinsoku import apply_kinsoku

@@ -126,6 +126,26 @@ def test_wrap_slide_keeps_hard_budget():
     assert out.replace("\n", " ") == text
 
 
+def test_wrap_two_lines_balanced():
+    # the scored break favors near-equal lines over the old greedy ceil fill
+    text = "She walked across the quiet bridge while the city lights flickered below"
+    out = wrap_cue_text(text, "en", 2)
+    lines = out.split("\n")
+    assert len(lines) == 2
+    assert abs(len(lines[0]) - len(lines[1])) <= 12  # roughly balanced
+    assert out.replace("\n", " ") == text
+
+
+def test_wrap_no_orphan_word_on_second_line():
+    # a lone short word must not be stranded on line 2 when a balanced break exists
+    text = "The committee deliberated for several exhausting hours before announcing it"
+    out = wrap_cue_text(text, "en", 2)
+    lines = out.split("\n")
+    assert len(lines) == 2
+    assert len(lines[1].split()) > 1, out
+    assert out.replace("\n", " ") == text
+
+
 def test_wrap_preserves_cjk_comma_space():
     # the space produced by a stripped comma in CJK (好 我们) must not be swallowed by the wrap logic
     assert wrap_cue_text("好 我们一起走吧好吗", "zh", 2) == "好 我们一起走吧好吗"
