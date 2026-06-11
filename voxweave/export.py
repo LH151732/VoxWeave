@@ -14,23 +14,46 @@ from pathlib import Path
 
 from voxweave.realign import parse_vtt_blocks
 
-# 1080p canvas: 22px outline text with generous margins matches the default
-# rendering of mainstream players at this resolution.
-_ASS_HEADER = """[Script Info]
+
+def ass_header(
+    *,
+    width: int = 1920,
+    height: int = 1080,
+    font: str = "Arial",
+    font_size: int | None = None,
+) -> str:
+    """ASS script header with a single Default style sized for the given canvas.
+
+    All metric values (font size, outline, shadow, margins) are tuned for a 1080p
+    canvas and scale linearly with the actual height, so burning onto e.g. a 2160p
+    frame keeps the same visual proportions.
+    """
+    scale = height / 1080
+    size = font_size if font_size is not None else round(72 * scale)
+    outline = round(3 * scale, 1)
+    shadow = round(1.5 * scale, 1)
+    margin_lr = round(120 * scale)
+    margin_v = round(60 * scale)
+    return f"""[Script Info]
 ScriptType: v4.00+
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 YCbCr Matrix: TV.709
-PlayResX: 1920
-PlayResY: 1080
+PlayResX: {width}
+PlayResY: {height}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,72,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,3,1.5,2,120,120,60,1
+Style: Default,{font},{size},&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,{outline},{shadow},2,{margin_lr},{margin_lr},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+
+
+# 1080p canvas: outline text with generous margins matches the default
+# rendering of mainstream players at this resolution.
+_ASS_HEADER = ass_header()
 
 _ITALIC_OPEN_RE = re.compile(r"<i>", re.IGNORECASE)
 _ITALIC_CLOSE_RE = re.compile(r"</i>", re.IGNORECASE)
@@ -94,9 +117,15 @@ def _ass_text(text: str) -> str:
     return t.replace("\n", "\\N")
 
 
-def render_ass(rows: list[tuple[float, float, str]]) -> str:
+def render_ass(
+    rows: list[tuple[float, float, str]], *, header: str | None = None
+) -> str:
     """Render an ASS script with a single Default style. Lyric cues (wrapped in
-    music notes by keep-lyrics mode) render italic per the Netflix convention."""
+    music notes by keep-lyrics mode) render italic per the Netflix convention.
+
+    ``header`` overrides the default 1080p script header (see :func:`ass_header`);
+    the burn path passes one sized to the actual video frame.
+    """
     events = []
     for start, end, text in rows:
         body = _ass_text(text)
@@ -105,7 +134,7 @@ def render_ass(rows: list[tuple[float, float, str]]) -> str:
         events.append(
             f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(end)},Default,,0,0,0,,{body}"
         )
-    return _ASS_HEADER + "\n".join(events) + "\n"
+    return (header if header is not None else _ASS_HEADER) + "\n".join(events) + "\n"
 
 
 _RENDERERS = {"srt": render_srt, "ass": render_ass}

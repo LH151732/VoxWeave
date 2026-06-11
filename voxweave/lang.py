@@ -103,3 +103,8 @@ def to_iso3(iso: str) -> str:
     """ISO-639-1 -> ISO-639-3 for uroman/ctc-forced-aligner. Unknown codes pass through unchanged."""
     code = (iso or "").lower()
     return _ISO1_TO_ISO3.get(code, code)
+
+
+def display_name(raw: str) -> str:
+    """Capitalized English language name for UI/track titles ("zh" -> "Chinese")."""
+    return _ISO_TO_NAME[to_iso(raw)].capitalize()

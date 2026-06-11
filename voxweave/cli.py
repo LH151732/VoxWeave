@@ -459,6 +459,156 @@ def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
         click.echo(str(path))
 
 
+@cli.command("pack")
+@click.argument(
+    "vtts",
+    metavar="VTT...",
+    nargs=-1,
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--media",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Source media (default: sibling file with the same stem; language tags"
+    " like .zh are stripped for the lookup).",
+)
+@click.option(
+    "--to",
+    "container",
+    type=click.Choice(["mkv", "mp4", "webm"]),
+    default=None,
+    help="Output container (default: keep the source container when it can store"
+    " text subtitles, else mkv).",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Output path (default: <media stem>.<container>, or <stem>.pack.<container>"
+    " when that would overwrite the source).",
+)
+def cmd_pack(
+    vtts: tuple[Path, ...],
+    media: Path | None,
+    container: str | None,
+    output: Path | None,
+) -> None:
+    """Mux VTT(s) into the media as soft subtitle tracks (stream copy, no re-encode).
+
+    Each track is titled "VoxWeave <Language>" with the container language tag set
+    from the VTT filename (episode.zh.vtt -> chi / "VoxWeave Chinese"); the first
+    packed track is flagged default. Existing streams are preserved (mp4/webm
+    targets drop image-based subtitle tracks they cannot store).
+    """
+    from voxweave import mux
+
+    out = _run(
+        lambda _rep: mux.pack(
+            list(vtts), media=media, container=container, output=output
+        ),
+        reporter=False,
+    )
+    click.echo(out)
+
+
+@cli.command("burn")
+@click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--media",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Source media (default: sibling file with the same stem; language tags"
+    " like .zh are stripped for the lookup).",
+)
+@click.option(
+    "--codec",
+    type=click.Choice(["hevc", "h264", "av1"]),
+    default="hevc",
+    help="Video codec (default: hevc — 10-bit capable, ~40% smaller than h264 at"
+    " equal quality, plays everywhere as hvc1 mp4; pick h264 only for legacy"
+    " devices, av1 for maximum compression on recent hardware).",
+)
+@click.option(
+    "--encoder",
+    default=None,
+    help="Force a specific ffmpeg encoder (default: auto — VideoToolbox on macOS,"
+    " NVENC on NVIDIA, libx264/libx265/libsvt-av1 software fallback).",
+)
+@click.option(
+    "--quality",
+    type=int,
+    default=None,
+    help="Constant-quality value (NVENC -cq / x264-x265-svtav1 -crf, lower = better;"
+    " VideoToolbox -q:v 1-100, higher = better). Default per encoder: h264 19 /"
+    " hevc 23 / av1 30 / VideoToolbox 65. Bitrate is never targeted.",
+)
+@click.option(
+    "--to",
+    "container",
+    type=click.Choice(["mp4", "mkv"]),
+    default="mp4",
+    help="Output container (default: mp4 for maximum player compatibility).",
+)
+@click.option(
+    "--font",
+    default="Arial",
+    help="Subtitle font family (fontconfig resolves fallbacks; e.g."
+    " 'Noto Sans CJK SC' for Chinese).",
+)
+@click.option(
+    "--font-size",
+    type=int,
+    default=None,
+    help="Font size in script pixels (default: 72 scaled to the video height).",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Output path (default: <media stem>.<container>, or <stem>.burn.<container>"
+    " when that would overwrite the source).",
+)
+def cmd_burn(
+    vtt: Path,
+    media: Path | None,
+    codec: str,
+    encoder: str | None,
+    quality: int | None,
+    container: str,
+    font: str,
+    font_size: int | None,
+    output: Path | None,
+) -> None:
+    """Burn the VTT into the video pixels (hardcoded subs) and drop all subtitle tracks.
+
+    Renders a styled ASS sized to the actual frame, re-encodes video at constant
+    quality with hardware acceleration when available (NVENC / VideoToolbox),
+    preserves the source bit depth (10-bit stays 10-bit on hevc/av1), and
+    stream-copies audio (mp4 targets re-encode incompatible codecs to AAC).
+    """
+    from voxweave import mux
+
+    out = _run(
+        lambda _rep: mux.burn(
+            vtt,
+            media=media,
+            codec=codec,
+            encoder=encoder,
+            quality=quality,
+            container=container,
+            font=font,
+            font_size=font_size,
+            output=output,
+        ),
+        reporter=False,
+    )
+    click.echo(out)
+
+
 @cli.command("correct")
 @click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(

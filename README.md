@@ -48,6 +48,8 @@ breaks) handles Chinese/Japanese/English as first-class.
   - [ASR correction (`correct`)](#asr-correction)
   - [Translate (`translate`)](#translate)
   - [Export (`export`)](#export)
+  - [Pack soft subtitles (`pack`)](#pack-soft-subtitles)
+  - [Burn hard subtitles (`burn`)](#burn-hard-subtitles)
 - [The edit-and-resync workflow](#the-edit-and-resync-workflow)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
@@ -305,6 +307,60 @@ voxweave export episode.vtt --to srt
 voxweave export episode.vtt --to srt --to ass
 ```
 
+### Pack (soft subtitles)
+
+`voxweave pack <vtt>...` — remux the source media with the VTT(s) added as proper subtitle
+tracks. Pure stream copy (instant, lossless, reversible); each track is titled
+`VoxWeave <Language>` with the container language tag taken from the VTT filename
+(`episode.zh.vtt` → `chi` / "VoxWeave Chinese"), and the first packed track is flagged
+default so players select it.
+
+```bash
+voxweave pack episode.zh.vtt                    # finds episode.<ext>, keeps its container
+voxweave pack episode.zh.vtt episode.ja.vtt     # several tracks at once
+voxweave pack episode.zh.vtt --to mp4           # mov_text in mp4 (image subs are dropped)
+voxweave pack episode.zh.vtt --media other.mkv -o out.mkv
+```
+
+mkv targets keep every source stream (including attachments); mp4/webm targets keep
+video+audio and existing *text* subtitle tracks only. HEVC video muxed into mp4 is tagged
+`hvc1` for Apple players.
+
+### Burn (hard subtitles)
+
+`voxweave burn <vtt>` — render the subtitles into the pixels and write a clean file with
+**all subtitle tracks removed**. A styled ASS is generated at the actual frame size (same
+look as `export`, lyric cues italic), then the video is re-encoded at constant quality with
+hardware acceleration when available: **NVENC** on NVIDIA, **VideoToolbox** on macOS,
+libx264/libx265/libsvt-av1 software fallback. Audio is stream-copied (mp4 targets re-encode
+mp4-incompatible codecs to AAC).
+
+```bash
+voxweave burn episode.zh.vtt                          # hevc, auto hw encoder, -> episode.mp4
+voxweave burn episode.zh.vtt --codec h264             # legacy-device compatibility
+voxweave burn episode.zh.vtt --codec av1 --to mkv     # max compression, recent hardware
+voxweave burn episode.zh.vtt --quality 20 --font "Noto Sans CJK SC"
+```
+
+<details>
+<summary>Burn options & encoding policy</summary>
+
+| Option         | Meaning                                                                                                    |
+| -------------- | ---------------------------------------------------------------------------------------------------------- |
+| `--codec`      | `hevc` (default: 10-bit capable, ~40% smaller than h264, plays everywhere as `hvc1` mp4) / `h264` / `av1`. |
+| `--encoder`    | Force a specific ffmpeg encoder (default: auto-probe with a test encode).                                  |
+| `--quality`    | Constant quality: NVENC `-cq` / software `-crf` (lower = better); VideoToolbox `-q:v` (higher = better).   |
+| `--to`         | `mp4` (default, maximum compatibility) or `mkv`.                                                           |
+| `--font`       | Subtitle font family (fontconfig resolves fallbacks; e.g. `Noto Sans CJK SC`).                             |
+| `--font-size`  | Override the default 72-at-1080p scaled size.                                                              |
+
+Bitrate is never targeted: pure constant-quality (`-b:v 0` on NVENC) lets the encoder spend
+bits where the content needs them, with no overshoot against the source rate. Source bit
+depth is preserved (10-bit stays 10-bit via `p010le`/`yuv420p10le`) except on h264 paths,
+which are kept 8-bit for player compatibility (NVENC h264 cannot encode 10-bit at all).
+
+</details>
+
 Progress is rendered with rich: countable stages (demix windows / PANNs batches / per-chunk
 ASR+alignment / align per-cue / translate streaming per-line) show a real `x/N` bar with
 elapsed time; indeterminate stages (decode / file write) show a pulse bar. `-v/--verbose`
@@ -318,6 +374,7 @@ voxweave episode.mkv          # 1. transcribe  -> episode.vtt + episode.json
 edit episode.vtt by hand      # 3. fix wording / line breaks
 voxweave align episode.vtt    # 4. re-derive timestamps from audio (overwrites VTT + JSON)
 voxweave translate episode.vtt --to zh   # 5. context-aware translation
+voxweave pack episode.zh.vtt             # 6. soft-mux into the media (or burn for hardsubs)
 ```
 
 Timestamps are **always** derived from the audio by the forced aligner — you never hand-edit
