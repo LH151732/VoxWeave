@@ -92,3 +92,31 @@ def test_dp_audio_end_caps_last_chunk():
     bounds = [(0.0, 2.0), (3.0, 5.0)]
     chunks = plan_dp_chunks(bounds, max_sec=240.0, pad_sec=0.5, audio_end=5.2)
     assert chunks[-1]["end"] == 5.2
+
+
+# --------------------------------------------------------------------------- #
+# subtract_spans: carve clean-dialogue windows out of song spans before the
+# vad_speech subtraction (dialogue spoken OVER a song must survive there).
+# --------------------------------------------------------------------------- #
+def test_subtract_spans_carves_keep_intervals():
+    from voxweave.songdet import subtract_spans
+
+    songs = [(660.0, 730.0)]
+    speech = [(676.0, 680.0), (726.0, 729.0)]
+    assert subtract_spans(songs, speech) == [
+        (660.0, 676.0),
+        (680.0, 726.0),
+        (729.0, 730.0),
+    ]
+
+
+def test_subtract_spans_noop_without_keep():
+    from voxweave.songdet import subtract_spans
+
+    assert subtract_spans([(1.0, 5.0)], []) == [(1.0, 5.0)]
+
+
+def test_subtract_spans_keep_swallows_whole_span():
+    from voxweave.songdet import subtract_spans
+
+    assert subtract_spans([(2.0, 4.0)], [(1.0, 5.0)]) == []

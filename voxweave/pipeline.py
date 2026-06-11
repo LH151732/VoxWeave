@@ -506,7 +506,17 @@ def transcribe(
             tmp.append(orig16k)
             orig_segs = vad_speech_segments(orig16k, threshold=SNAP_VAD_THRESHOLD)
             if song_spans:
-                orig_segs, _ = excise_spans_from_segments(orig_segs, song_spans)
+                # Subtract only the truly sung/instrumental parts: clean-dialogue
+                # windows inside expanded song spans (dialogue spoken OVER the
+                # song) must survive in vad_speech, otherwise snapping and the
+                # emission mask forbid those words' true location and the aligner
+                # smears them across the song (observed on movie dialogue-over-
+                # montage: a 15s exchange stretched over 65s).
+                from voxweave.songdet import subtract_spans
+
+                orig_segs, _ = excise_spans_from_segments(
+                    orig_segs, subtract_spans(song_spans, speech_spans)
+                )
             vad_spans = [(s["start"], s["end"]) for s in orig_segs]
         else:
             vad_spans = [(s["start"], s["end"]) for s in segs]

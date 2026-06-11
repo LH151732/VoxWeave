@@ -425,6 +425,33 @@ def group_segments_by_spans(
     return groups
 
 
+def subtract_spans(
+    spans: list[tuple[float, float]], keep: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Interval subtraction: ``spans`` minus every interval in ``keep`` (both sorted).
+
+    Used to carve clean-dialogue windows out of expanded song spans before they
+    are subtracted from the VAD timing reference: dialogue spoken OVER a song
+    must survive in vad_speech or the emission mask forbids its true location.
+    """
+    out: list[tuple[float, float]] = []
+    for a, b in spans:
+        cur = a
+        for ka, kb in keep:
+            if kb <= cur:
+                continue
+            if ka >= b:
+                break
+            if ka > cur:
+                out.append((cur, ka))
+            cur = max(cur, kb)
+            if cur >= b:
+                break
+        if cur < b:
+            out.append((cur, b))
+    return out
+
+
 def window_probs(
     wav_path: Path, *, batch: int = 32, progress=None
 ) -> tuple[np.ndarray, list[float]] | None:

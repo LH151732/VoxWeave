@@ -233,6 +233,15 @@ def cli(verbose: bool) -> None:
     " it (default: on; audio-only media skips automatically). Cut times persist to the"
     " sibling JSON for `split` re-runs; window via VOXWEAVE_SHOT_SNAP_MS.",
 )
+@click.option(
+    "--vad-mask",
+    is_flag=True,
+    default=False,
+    help="Suppress CTC emissions outside speech spans during alignment so words cannot"
+    " park in music/silence (recommended for sparse-dialogue movies with songs; keep"
+    " off when VAD may misjudge sung/whispered speech). Same as"
+    " VOXWEAVE_VAD_EMISSION_MASK=1.",
+)
 def cmd_transcribe(
     media: Path,
     language: str | None,
@@ -248,8 +257,11 @@ def cmd_transcribe(
     hybrid: bool,
     timestamps: bool,
     shot_snap: bool,
+    vad_mask: bool,
 ) -> None:
     """Media -> (vocal separation) -> VAD -> local ASR/alignment -> smart_split -> write VTT+JSON."""
+    if vad_mask:  # flag form of the env knob; backend reads the env at align time
+        os.environ["VOXWEAVE_VAD_EMISSION_MASK"] = "1"
     out = _run(
         lambda rep: pipeline.process(
             media,
@@ -342,18 +354,30 @@ def cmd_split(
     default=False,
     help="Apply loudnorm to the 16k alignment input.",
 )
+@click.option(
+    "--vad-mask",
+    is_flag=True,
+    default=False,
+    help="Suppress CTC emissions outside the JSON's vad_speech spans so words cannot"
+    " park in music/silence (recommended for sparse-dialogue movies with songs;"
+    " keep off when VAD may misjudge sung/whispered speech). Same as"
+    " VOXWEAVE_VAD_EMISSION_MASK=1.",
+)
 def cmd_align(
     vtt: Path,
     media: Path | None,
     language: str | None,
     separate: bool,
     normalize: bool,
+    vad_mask: bool,
 ) -> None:
     """Re-align after editing: run forced alignment on edited VTT text against the original audio,
     overwrite VTT with timestamps, and update JSON.
 
     **Loads alignment/separation models locally** (in-process PyTorch, see voxweave.backend); no endpoint calls.
     """
+    if vad_mask:  # flag form of the env knob; backend reads the env at align time
+        os.environ["VOXWEAVE_VAD_EMISSION_MASK"] = "1"
     out = _run(
         lambda rep: pipeline.align(
             vtt,
