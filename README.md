@@ -45,6 +45,7 @@ breaks) handles Chinese/Japanese/English as first-class.
   - [Re-layout offline (`split`)](#re-layout-offline)
   - [ASR correction (`correct`)](#asr-correction)
   - [Translate (`translate`)](#translate)
+  - [Export (`export`)](#export)
 - [The edit-and-resync workflow](#the-edit-and-resync-workflow)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
@@ -196,6 +197,10 @@ voxweave episode.mkv --model qwen3-asr-1.7B   # larger, more accurate ASR
 | `--model`                      | Local ASR model (default `Qwen3-ASR-0.6B`; `qwen3-asr-1.7B` is more accurate).                          |
 | `--normalize`                  | Apply loudness normalization (`loudnorm`) to the 16k ASR input.                                         |
 | `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.    |
+| `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export). |
+| `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps. |
+| `--diarize`                    | pyannote speaker diarization: two-speaker cues become dual-speaker events (`-line` per speaker). Needs `voxweave[diarize]` + an HF token (`VOXWEAVE_HF_TOKEN`) for the gated checkpoint. |
+| `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules). |
 | `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`. |
 
 </details>
@@ -283,6 +288,17 @@ voxweave translate episode.vtt --to en --context "sci-fi, formal register" --glo
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key.                            |
 
 </details>
+
+### Export
+
+`voxweave export <vtt>` — render an aligned VTT into SRT and/or ASS next to it (the VTT + JSON
+pair stays the source of truth). ASS carries a Default style; lyric cues (`♪ ... ♪`) render
+italic.
+
+```bash
+voxweave export episode.vtt --to srt
+voxweave export episode.vtt --to srt --to ass
+```
 
 Progress is rendered with rich: countable stages (demix windows / PANNs batches / per-chunk
 ASR+alignment / align per-cue / translate streaming per-line) show a real `x/N` bar with
@@ -403,7 +419,9 @@ ja = "mms"                                      # Japanese: MMS-300m + uroman fu
 
 Each input produces two sibling files:
 
-- **`<stem>.json`** — the source of truth: word/character-level segments, language, VAD speech.
+- **`<stem>.json`** — the source of truth: word/character-level segments, language, VAD speech,
+  plus optional replay data (`shot_changes`, `sing_spans`, `speaker_turns`) so `split` can
+  redo shot snapping, lyric flagging, and speaker formatting without re-running any model.
 - **`<stem>.vtt`** — editable subtitles. By default cues carry word-level timestamps (same
   precision as `align` output, ready to use); `--no-timestamps` writes a plain-text editing
   draft for hand-correction, which `align` re-times.
