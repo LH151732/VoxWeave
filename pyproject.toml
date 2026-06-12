@@ -79,6 +79,12 @@ cuda = [
   "qwen-asr>=0.0.4",
   "onnxruntime-gpu>=1.20; sys_platform != 'darwin'",
   "faster-whisper>=1.1; sys_platform != 'darwin'",
+  # transformers 4.57.6 (qwen-asr pin) runtime-gates huggingface-hub<1.0 in its
+  # dependency_versions_table, but its wheel metadata is looser — the resolver happily
+  # locks hub 1.x and then EVERY `import transformers` dies at the version check
+  # (ASR + the en HF aligner path). Bound it in this extra only: the [mps] fork's
+  # transformers 5.x needs hub>=1.0, so the pin cannot live in core deps.
+  "huggingface-hub<1.0",
 ]
 # Apple Silicon (macOS / MPS) build. ASR + forced alignment are served by the native MLX ports
 # from mlx-audio (Metal kernels + quantization; see voxweave.backend_mlx) — faster and lower-memory
