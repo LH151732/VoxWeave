@@ -17,7 +17,7 @@ insert songs. Local-first Qwen3 ASR, forced alignment, and edit-and-resync — C
 ![Apple Silicon MLX](https://img.shields.io/badge/Apple_Silicon-MLX-000000?logo=apple&logoColor=white)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/hali0515)
 
-https://github.com/user-attachments/assets/e75b6dd3-fa37-4afe-89db-b6ee2c28f6bc
+<https://github.com/user-attachments/assets/e75b6dd3-fa37-4afe-89db-b6ee2c28f6bc>
 
 <sub>Sliced clip under heavy BGM · <code>voxweave Test.mp4</code> · Qwen3-ASR-1.7B</sub>
 
@@ -121,6 +121,7 @@ uv tool install "voxweave[mps]"                          # full pipeline + MLX W
 The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
 Japanese/CJK), layout, song-skip — plus CJK line-break and translation are baked into the
 **core dependencies**. The variant selects the compute platform **and the ASR/alignment backend**:
+
 - `[cuda]` (NVIDIA/Linux): the in-process PyTorch Qwen3-ASR + forced aligner (`qwen-asr`), GPU
   onnxruntime (CUDAExecutionProvider for MMS alignment), and the faster-whisper hybrid engine.
 - `[mps]` (Apple Silicon/macOS): **ASR** runs on the native MLX Qwen3-ASR from
@@ -197,21 +198,21 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 <details>
 <summary><b>Options</b></summary>
 
-| Option                         | Description                                                                                             |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------- |
-| `--language`                   | Force language (ISO code or full name); default auto-detect.                                            |
-| `--no-separate`                | Skip vocal separation (for clean speech) to save GPU time.                                              |
-| `--no-skip-songs`              | Keep lyrics / transcribe purely musical content (song-skip is on by default).                           |
-| `--model`                      | Local ASR model (default `Qwen3-ASR-0.6B`; `qwen3-asr-1.7B` is more accurate).                          |
-| `--context`                    | ASR bias prompt: names/terms likely to appear (comma or newline separated). Bare term lists are auto-framed as `Proper nouns: ...` for Qwen — a bare list actually *regresses* accuracy ([details](https://github.com/TypeWhisper/typewhisper-mac/issues/321)); prose or pre-framed text passes through. |
-| `--hybrid`                     | Dual-ASR fusion: Whisper text + Qwen punctuation. Whisper's error bias is the opposite of Qwen's (it hallucinates rather than omits), so use this when Qwen drops uncertain words. |
-| `--normalize`                  | Apply loudness normalization (`loudnorm`) to the 16k ASR input — helps when quiet words get dropped; off by default since it also amplifies noise. |
-| `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.    |
-| `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export). |
-| `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps. |
-| `--diarize`                    | pyannote speaker diarization: two-speaker cues become dual-speaker events (`-line` per speaker). Needs `voxweave[diarize]` + an HF token (`VOXWEAVE_HF_TOKEN`) for the gated checkpoint. |
-| `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules). |
-| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`. |
+| Option                         | Description                                                                                                                                                                                                                                                                                              |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--language`                   | Force language (ISO code or full name); default auto-detect.                                                                                                                                                                                                                                             |
+| `--no-separate`                | Skip vocal separation (for clean speech) to save GPU time.                                                                                                                                                                                                                                               |
+| `--no-skip-songs`              | Keep lyrics / transcribe purely musical content (song-skip is on by default).                                                                                                                                                                                                                            |
+| `--model`                      | Local ASR model (default `Qwen3-ASR-0.6B`; `qwen3-asr-1.7B` is more accurate).                                                                                                                                                                                                                           |
+| `--context`                    | ASR bias prompt: names/terms likely to appear (comma or newline separated). Bare term lists are auto-framed as `Proper nouns: ...` for Qwen — a bare list actually _regresses_ accuracy ([details](https://github.com/TypeWhisper/typewhisper-mac/issues/321)); prose or pre-framed text passes through. |
+| `--hybrid`                     | Dual-ASR fusion: Whisper text + Qwen punctuation. Whisper's error bias is the opposite of Qwen's (it hallucinates rather than omits), so use this when Qwen drops uncertain words.                                                                                                                       |
+| `--normalize`                  | Apply loudness normalization (`loudnorm`) to the 16k ASR input — helps when quiet words get dropped; off by default since it also amplifies noise.                                                                                                                                                       |
+| `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.                                                                                                                                                                                                     |
+| `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export).                                                                                                                                                                                              |
+| `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
+| `--diarize`                    | pyannote speaker diarization: two-speaker cues become dual-speaker events (`-line` per speaker). Needs `voxweave[diarize]` + an HF token (`VOXWEAVE_HF_TOKEN`) for the gated checkpoint.                                                                                                                 |
+| `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
+| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`.                                                                                                                                                                                                  |
 
 </details>
 
@@ -326,7 +327,7 @@ voxweave pack episode.zh.vtt --media other.mkv -o out.mkv
 ```
 
 mkv targets keep every source stream (including attachments); mp4/webm targets keep
-video+audio and existing *text* subtitle tracks only. HEVC video muxed into mp4 is tagged
+video+audio and existing _text_ subtitle tracks only. HEVC video muxed into mp4 is tagged
 `hvc1` for Apple players.
 
 ### Burn (hard subtitles)
@@ -348,14 +349,14 @@ voxweave burn episode.zh.vtt --quality 20 --font "Noto Sans CJK SC"
 <details>
 <summary>Burn options & encoding policy</summary>
 
-| Option         | Meaning                                                                                                    |
-| -------------- | ---------------------------------------------------------------------------------------------------------- |
-| `--codec`      | `hevc` (default: 10-bit capable, ~40% smaller than h264, plays everywhere as `hvc1` mp4) / `h264` / `av1`. |
-| `--encoder`    | Force a specific ffmpeg encoder (default: auto-probe with a test encode).                                  |
-| `--quality`    | Constant quality: NVENC `-cq` / software `-crf` (lower = better); VideoToolbox `-q:v` (higher = better).   |
-| `--to`         | `mp4` (default, maximum compatibility) or `mkv`.                                                           |
-| `--font`       | Subtitle font family (fontconfig resolves fallbacks; e.g. `Noto Sans CJK SC`).                             |
-| `--font-size`  | Override the default 72-at-1080p scaled size.                                                              |
+| Option        | Meaning                                                                                                    |
+| ------------- | ---------------------------------------------------------------------------------------------------------- |
+| `--codec`     | `hevc` (default: 10-bit capable, ~40% smaller than h264, plays everywhere as `hvc1` mp4) / `h264` / `av1`. |
+| `--encoder`   | Force a specific ffmpeg encoder (default: auto-probe with a test encode).                                  |
+| `--quality`   | Constant quality: NVENC `-cq` / software `-crf` (lower = better); VideoToolbox `-q:v` (higher = better).   |
+| `--to`        | `mp4` (default, maximum compatibility) or `mkv`.                                                           |
+| `--font`      | Subtitle font family (fontconfig resolves fallbacks; e.g. `Noto Sans CJK SC`).                             |
+| `--font-size` | Override the default 72-at-1080p scaled size.                                                              |
 
 Bitrate is never targeted: pure constant-quality (`-b:v 0` on NVENC) lets the encoder spend
 bits where the content needs them, with no overshoot against the source rate. Output bit
@@ -387,14 +388,14 @@ them. Edit the text freely; `align` puts the timing back.
 
 ## How it works
 
-| Stage           | What runs                                                                                                                  |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| **Separation**  | Mel-Band Roformer (full-band 44.1k stereo, vendored pure-torch) isolates vocals; downsampled to 16k afterwards.            |
-| **Song-skip**   | PANNs (route ii) flags singing/music on the separated vocals before ASR.                                                   |
-| **Chunking**    | Silero VAD splits speech into ≤120s chunks (longer risks ASR repetition-loop collapse).                                    |
+| Stage           | What runs                                                                                                                                                        |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Separation**  | Mel-Band Roformer (full-band 44.1k stereo, vendored pure-torch) isolates vocals; downsampled to 16k afterwards.                                                  |
+| **Song-skip**   | PANNs (route ii) flags singing/music on the separated vocals before ASR.                                                                                         |
+| **Chunking**    | Silero VAD splits speech into ≤120s chunks (longer risks ASR repetition-loop collapse).                                                                          |
 | **ASR + align** | Qwen3-ASR (default, text + units in one pass) / Whisper hybrid (faster-whisper on cuda, mlx-whisper on mps) / dual-ASR fusion — the pipeline is engine-agnostic. |
-| **Alignment**   | `ja` → MMS-300m + uroman (full-file single pass, WhisperX-gold); `en` → wav2vec2-LV60K CTC per-cue; `zh`·`yue` → Qwen.     |
-| **Layout**      | gap-aware `smart_split`: word-level gaps + BudouX phrase atoms + line-length, on a shared timeline forked per language.    |
+| **Alignment**   | `ja` → MMS-300m + uroman (full-file single pass, WhisperX-gold); `en` → wav2vec2-LV60K CTC per-cue; `zh`·`yue` → Qwen.                                           |
+| **Layout**      | gap-aware `smart_split`: word-level gaps + BudouX phrase atoms + line-length, on a shared timeline forked per language.                                          |
 
 ## Configuration
 
